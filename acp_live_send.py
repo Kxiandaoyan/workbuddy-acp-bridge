@@ -1,29 +1,24 @@
 #!/usr/bin/env python
 """
-acp_live_send.py -- Send a message into a LIVE WorkBuddy (CodeBuddy Code)
-PC-client conversation so it appears in the PC client UI in REAL TIME, and
-the agent's reply comes back on stdout.
+acp_live_send.py -- Send a message into a LIVE WorkBuddy PC-client conversation
+so it appears in the PC client UI in REAL TIME.
 
-Why this exists: WorkBuddy is an agent runtime, and other agent systems
-(Claude / Codex / Hermes / OpenClaw / ...) often need to hand a task to the
-WorkBuddy agent that already has the right session context open on the user's
-desktop -- instead of starting a fresh, context-free session. This tool is the
-bridge for that hand-off, which makes multi-agent collaboration practical.
-
-How: the PC client's own daemon spawns an "interactive" ACP session for each
-conversation opened in the client. Sending session/prompt to THAT session's
-/api/v1/acp endpoint updates the conversation, and the daemon pushes
-wb:event -> main -> renderer, so the PC client UI refreshes live.
+Key insight (2026-09-16): the PC client's own daemon (daemon-app-server-entry.js
+--stdio, child of WorkBuddy.exe main process) owns "interactive" ACP sessions
+spawned from its prewarm pool. Sending session/prompt to THAT session's
+/api/v1/acp endpoint updates the PC client's conversation and the daemon pushes
+wb:event -> main -> renderer -> live UI update.
 
 The ACP main channel /api/v1/acp is loopback-exempt (AcpSecurityMiddleware),
-and POST /api/v1/acp/connect issues a fresh connectionId + sessionToken with
-NO password -- everything runs on 127.0.0.1 only.
+and POST /api/v1/acp/connect issues a fresh connectionId + sessionToken with NO
+password. This is the channel "their app" uses -- NOT the separate
+`codebuddy --serve` daemon we used before (9527), which the PC client never
+subscribed to.
 
 Usage:
   python acp_live_send.py --list
-  python acp_live_send.py --session-id <uuid> --cwd "C:\\path\\to\\project" --msg "hello"
-  python acp_live_send.py --cwd "C:\\path\\to\\project" --msg "hello"   # auto-pick session
-  python acp_live_send.py --session-id <uuid> --check                  # busy? don't send
+  python acp_live_send.py --session-id <uuid> --cwd "D:\\hermes\\workbuddy" --msg "hello"
+  python acp_live_send.py --cwd "D:\\hermes\\workbuddy" --msg "hello"   # auto-pick session
 """
 import argparse, json, os, re, socket, subprocess, sys, time, urllib.request, urllib.error
 
@@ -109,10 +104,37 @@ def find_live_endpoint(session_id=None, cwd=None):
     best = cands[-1]
     return best["port"], best["sessionId"], best.get("cwd")
 
+# ---------------------------------------------------------------- activation
+
+def activate_via_deeplink(session_id, timeout=25):
+    """Bring a conversation alive in the PC client without any manual click.
+
+    The client registers the `workbuddy://` URL scheme; opening
+    `workbuddy://chat/<sessionId>` focuses that conversation in the UI, and
+    the client's daemon then promotes a prewarm CLI process into an interactive
+    session for it (a live 127.0.0.1 port appears in the session registry).
+    Returns the live endpoint tuple, or None if it did not come up in time.
+    """
+    if not session_id:
+        return None
+    url = "workbuddy://chat/%s" % session_id
+    try:
+        os.startfile(url)  # Windows: shell-execute the registered URL scheme
+    except Exception as e:
+        print("activate: failed to open deep link: %s" % e)
+        return None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        found = find_live_endpoint(session_id=session_id)
+        if found:
+            return found
+    return None
+
 # ---------------------------------------------------------------- busy check
 
 def _project_key(cwd):
-    """C:\\Users\\you\\my-project -> c-users-you-my-project (drive letter lower + joined)."""
+    """D:\\hermes\\workbuddy -> d-hermes-workbuddy (drive letter lower + joined)."""
     p = (cwd or "").replace("\\", "/").strip("/")
     if not p:
         return None
@@ -266,7 +288,7 @@ class AcpClient:
         st, r = self._post("/api/v1/acp", {
             "jsonrpc": "2.0", "id": self._next_id(), "method": "initialize",
             "params": {"protocolVersion": 1,
-                       "clientInfo": {"name": "acp-bridge", "version": "1.0.0"},
+                       "clientInfo": {"name": "hermes-bridge", "version": "1.0.0"},
                        "clientCapabilities": {}}}, self._auth(), timeout=30)
         text, _ = self._read_sse(r, max_bytes=200000)
         return st, text
@@ -308,6 +330,9 @@ def main():
     ap.add_argument("--msg", required=False)
     ap.add_argument("--wait-idle", type=int, default=0,
                     help="seconds to wait for session to become idle before sending")
+    ap.add_argument("--ensure", action="store_true",
+                    help="if no live endpoint exists, auto-activate the "
+                         "conversation via the workbuddy:// deep link first")
     args = ap.parse_args()
 
     if args.list:
@@ -324,17 +349,26 @@ def main():
         ap.error("--msg is required unless --list / --check")
 
     found = find_live_endpoint(args.session_id, args.cwd)
+    if not found and args.ensure and args.session_id:
+        print("no live endpoint; activating %s via deep link..." % args.session_id)
+        found = activate_via_deeplink(args.session_id)
+        if not found:
+            print("ERROR: deep link did not bring up a live session for %s" %
+                  args.session_id, file=sys.stderr)
+            return 2
     if not found:
         print("ERROR: no live interactive session for session-id=%s cwd=%s" %
               (args.session_id, args.cwd), file=sys.stderr)
         print("available:", file=sys.stderr)
         for c in list_interactive_sessions():
             print("  pid=%s session=%s cwd=%s" % (c["pid"], c["sessionId"], c.get("cwd")), file=sys.stderr)
+        print("hint: pass --ensure to auto-activate the conversation via the "
+              "workbuddy:// deep link (requires --session-id)", file=sys.stderr)
         return 2
     port, session_id, cwd = found
     print("live session: pid-port=%s session=%s cwd=%s" % (port, session_id, cwd))
 
-    # ---- busy gate: don't barge into a task the agent is still running
+    # ---- busy gate (user requirement: don't barge into a running task)
     if args.wait_idle:
         deadline = time.time() + args.wait_idle
         while time.time() < deadline:
@@ -346,8 +380,7 @@ def main():
 
     busy, last = _last_busy_state(cwd, session_id)
     if busy:
-        # Clear, caller-relayable notice. The calling agent should hand this
-        # line back to its own user.
+        # Clear, caller-relayable notice. Hermes should hand this line to the user.
         print("BUSY|现在会话正忙，请稍后再发。|session=%s|last_status=%s" % (session_id, last))
         return 4
 

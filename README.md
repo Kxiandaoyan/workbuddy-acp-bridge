@@ -51,9 +51,9 @@ pid=39092  port=13416  session=<uuid>  cwd=C:\path\to\project
 ```
 
 > **前提**：目标对话必须在 PC 客户端里**打开/聚焦过**，客户端的 daemon 才会为它
-> 激活 interactive session。空闲一段时间后 session 会被回收（端口随之消失），
-> 此时发消息会报 “no live interactive session”——在客户端里点一下那个对话
-> 重新激活即可。
+> 激活 interactive session；空闲一段时间后 session 会被回收（端口随之消失），
+> 此时发消息会报 “no live interactive session”。**加 `--ensure` 可以自动重新
+> 激活**（见 2b），或者在客户端里点一下那个对话。
 
 ### 2. 发消息（用 sessionId 精确指定，推荐）
 
@@ -66,6 +66,21 @@ python acp_live_send.py --session-id <uuid> --msg "回测跑完了，把结果�
 ```bash
 python acp_live_send.py --cwd "C:\path\to\project" --msg "..."
 ```
+
+### 2b. 会话没活端点？自动激活（`--ensure`）
+
+会话空闲一段时间后会被客户端回收回预热池，此时直接发会报
+“no live interactive session”。**不用手动去客户端点那个对话**，
+加 `--ensure` 就行——工具会打开 `workbuddy://chat/<sessionId>` 协议链接，
+客户端接到后自动把该对话重新激活成一个活会话：
+
+```bash
+python acp_live_send.py --session-id <uuid> --msg "..." --ensure
+```
+
+> 前提是 PC 客户端正在运行，且系统已注册 `workbuddy://` 协议（安装客户端时
+> 自动注册）。`--ensure` 需要 `--session-id`（按 cwd 匹配时无法确定要激活
+> 哪个对话）。这条路径让外部 agent 可以**完全无人值守**地投递消息。
 
 ### 3. 只检查忙闲，不发消息
 
