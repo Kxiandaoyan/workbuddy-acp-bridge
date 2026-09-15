@@ -1,0 +1,136 @@
+# WorkBuddy ACP Bridge
+
+**让其他 agent（Claude、Codex、Hermes、OpenClaw 等）直接给 WorkBuddy 桌面客户端里
+已经打开的会话发消息，消息在 PC 客户端界面实时显示，并把 WorkBuddy 的回复拿回来。**
+
+## 为什么需要它
+
+多 agent 协作里最常见的痛点：你在 Claude / Codex / Hermes / OpenClaw 那边跑分析、
+跑回测、跑工程任务，但真正有完整代码上下文、有工具权限、有项目历史的是
+WorkBuddy（CodeBuddy Code）里那个已经打开的会话。如果让外部 agent 新开一个会话，
+上下文是空的，什么都要重讲一遍。
+
+这个桥接解决的就是这一步：**把外部 agent 的结论/指令，投递到用户桌面上那个
+“懂行”的 WorkBuddy 会话里**，用户在自己的 PC 客户端里就能实时看到消息和回复，
+不用切换窗口、不用复制粘贴。
+
+```
+外部 agent（Claude / Codex / Hermes / OpenClaw / 任何能跑 Python 的进程）
+   │  acp_live_send.py  -- 本地 127.0.0.1，无需任何密码或令牌
+   ▼
+WorkBuddy PC 客户端的 interactive session（客户端自己 daemon 激活的）
+   │  daemon → 主进程 wb:event → 渲染进程
+   ▼
+PC 客户端对话界面实时显示消息 + WorkBuddy agent 的回复
+```
+
+**安全模型**：全部流量都在 `127.0.0.1` 上。WorkBuddy 的 ACP 主通道对 loopback
+做了豁免，`POST /api/v1/acp/connect` 直接下发一次性的 `connectionId` + `sessionToken`，
+不需要任何长期密钥、不需要登录、不需要配置。本工具也不读写任何凭证文件。
+
+## 文件
+
+| 文件 | 说明 |
+|---|---|
+| `acp_live_send.py` | **核心工具**。自动发现活跃会话端点 → 免密 connect → load → prompt。Python 标准库，零依赖。 |
+| `acp_live_test.py` | 最小冒烟测试（手动传端口），用来单独验证 ACP 四步调用链。 |
+| `README.md` | 本文档。 |
+
+## 用法
+
+只需要 Python 3（标准库即可，无第三方依赖）。
+
+### 1. 列出当前活跃的会话
+
+```bash
+python acp_live_send.py --list
+```
+
+```
+pid=39092  port=13416  session=<uuid>  cwd=C:\path\to\project
+```
+
+> **前提**：目标对话必须在 PC 客户端里**打开/聚焦过**，客户端的 daemon 才会为它
+> 激活 interactive session。空闲一段时间后 session 会被回收（端口随之消失），
+> 此时发消息会报 “no live interactive session”——在客户端里点一下那个对话
+> 重新激活即可。
+
+### 2. 发消息（用 sessionId 精确指定，推荐）
+
+```bash
+python acp_live_send.py --session-id <uuid> --msg "回测跑完了，把结果汇总到报告里"
+```
+
+也可以按项目路径自动匹配会话（不用记 UUID）：
+
+```bash
+python acp_live_send.py --cwd "C:\path\to\project" --msg "..."
+```
+
+### 3. 只检查忙闲，不发消息
+
+```bash
+python acp_live_send.py --session-id <uuid> --check
+```
+
+输出固定为一行 `状态|提示语|session=...|last_status=...`，退出码区分状态，
+调用方可以直接取提示语转发给自己的用户：
+
+| 退出码 | 输出 | 含义 |
+|---|---|---|
+| 0 | `IDLE\|会话空闲，可以发送。\|...` | 空闲，可发 |
+| 4 | `BUSY\|现在会话正忙，请稍后再发。\|...` | 正忙，别发 |
+
+### 4. 忙时等待 / 不闯入
+
+```bash
+python acp_live_send.py --session-id <uuid> --msg "..." --wait-idle 60
+```
+
+仍在忙就每 2 秒轮询一次，直到空闲或超时（超时同样以退出码 4 返回
+`BUSY|...`），避免打断 WorkBuddy 正在执行的任务。
+
+> **同一会话同时只应有一个调用方在发**。拿到 BUSY 就退出，不要重试轰炸。
+
+## 多 agent 协作的典型姿势
+
+- **分工投递**：Hermes 负责数据采集和回测，把结论用一句话发给 WorkBuddy 会话，
+  让有项目上下文的 WorkBuddy 接着写代码 / 改策略 / 出报告。
+- **人工在环**：外部 agent 每次投递前先 `--check`，忙就返回
+  “现在会话正忙，请稍后再发。”，用户决定什么时候再试——消息不会
+  静默丢失，也不会互相覆盖。
+- **双向闭环**：`acp_live_send.py` 把 WorkBuddy 的回复尾部打到 stdout，
+  外部 agent 可以直接读回来继续处理。
+
+## ACP 调用序列（排错时照着对）
+
+```
+POST /api/v1/acp/connect   （无 body，免密）    → {"connectionId":..., "sessionToken":...}
+POST /api/v1/acp  headers: acp-connection-id + acp-session-token + x-codebuddy-request:1
+POST /api/v1/acp           initialize           → 握手 + agentCapabilities
+POST /api/v1/acp           session/load   {sessionId, cwd, mcpServers:[]}
+POST /api/v1/acp           session/prompt {sessionId, prompt:[{type:"text",text:...}]}
+                             → SSE 流：agent_message_chunk / tool_call / session_end
+```
+
+- **`session/load` 必须带 `mcpServers: []`**，否则报
+  `Invalid params: mcpServers expected array`。
+- **`session/prompt` 必须带 `sessionId`**，否则报 `sessionId expected string`。
+- prompt 的 SSE 是 chunked 流，agent 跑完才结束；检测到
+  `finishReason:stop` / `outcome:SUCCESS` 后主动断开，避免长连接卡死。
+- **端点发现**：`~/.workbuddy/sessions/<pid>.json` 里 `kind == "interactive"`
+  且 `sessionId` 匹配的记录 → 取 `pid` → `netstat -ano` 找该 pid 在
+  127.0.0.1 上的 LISTENING 端口。**端口每次都变**（session 用完会被回收
+  回 prewarm 池），必须每次实时发现，不能固化。
+
+## 已知限制
+
+- 只能投递到 PC 客户端**已经打开过的**会话（客户端未激活的对话没有活端点）。
+- 同一会话一次只能处理一条消息；并发投递会互相打断。
+- 忙闲判断依赖读取会话 transcript 文件的尾部状态，属于本地最优估计，
+  极端情况下（例如 agent 刚好在两种状态之间）可能有几秒延迟。
+- 仅在 Windows + WorkBuddy PC 客户端环境下验证过。
+
+## 许可
+
+MIT。
