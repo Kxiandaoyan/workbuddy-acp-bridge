@@ -1,7 +1,29 @@
-# WorkBuddy ACP Bridge
+# Agent Bridges（WorkBuddy / ZCode）
 
-**让其他 agent（Claude、Codex、Hermes、OpenClaw 等）直接给 WorkBuddy 桌面客户端里
-已经打开的会话发消息，消息在 PC 客户端界面实时显示，并把 WorkBuddy 的回复拿回来。**
+**本仓库提供两个桥接工具，让其他 agent（Claude、Codex、Hermes、OpenClaw 等）
+投递消息到用户桌面上已经打开、已有完整上下文的会话——不用新开会话、不用重讲背景。**
+
+| 桥接 | 投递目标 | 一句话定位 | 入口 |
+|---|---|---|---|
+| **WorkBuddy 桥接** | WorkBuddy（CodeBuddy Code）PC 客户端 | 消息**实时显示**在客户端界面，用户看得见 | [`acp_live_send.py`](#文件)（本目录） |
+| **ZCode 桥接** | ZCode 桌面端 / CLI | **借用指定会话的上下文**接着干，把结果拿回来 | [`zcode-bridge/`](zcode-bridge/README.md)（子目录） |
+
+两者都用 Python 标准库写成、零依赖、都带忙闲检测，且**忙闲输出格式完全一致**
+（`IDLE|...` / `BUSY|现在会话正忙，请稍后再发。|...`，退出码 0/4），
+调用方可以用同一套逻辑对接两个目标。按需选一个：
+
+- 想让用户**在界面上实时看到**外部 agent 发来的消息 → WorkBuddy 桥接
+- 只想让外部 agent **用上某会话的上下文把活干完、把结果拿回来** → ZCode 桥接
+
+> 下文是 **WorkBuddy 桥接**的完整说明；ZCode 桥接的用法见
+> [`zcode-bridge/README.md`](zcode-bridge/README.md)。
+
+---
+
+# WorkBuddy 桥接（`acp_live_send.py`）
+
+**直接给 WorkBuddy 桌面客户端里已经打开的会话发消息，消息在 PC 客户端界面
+实时显示，并把 WorkBuddy 的回复拿回来。**
 
 ## 为什么需要它
 
@@ -32,9 +54,11 @@ PC 客户端对话界面实时显示消息 + WorkBuddy agent 的回复
 
 | 文件 | 说明 |
 |---|---|
-| `acp_live_send.py` | **核心工具**。自动发现活跃会话端点 → 免密 connect → load → prompt。Python 标准库，零依赖。 |
+| `acp_live_send.py` | **WorkBuddy 桥接核心工具**。自动发现活跃会话端点 → 免密 connect → load → prompt。Python 标准库，零依赖。 |
 | `acp_live_test.py` | 最小冒烟测试（手动传端口），用来单独验证 ACP 四步调用链。 |
-| `README.md` | 本文档。 |
+| `zcode-bridge/zcode_send.py` | **ZCode 桥接核心工具**。按 sessionId 或项目目录进入指定会话续聊（`--resume`），借用完整上下文。 |
+| `zcode-bridge/README.md` | ZCode 桥接的完整文档（原理 / 繁忙检测 / 与本桥接的分工）。 |
+| `README.md` | 本文档（两个桥接的总说明 + WorkBuddy 桥接详细用法）。 |
 
 ## 用法
 
@@ -150,12 +174,32 @@ POST /api/v1/acp           session/prompt {sessionId, prompt:[{type:"text",text:
 
 MIT。
 
-## 相关：ZCode 桥接（[`zcode-bridge/`](zcode-bridge/README.md)）
+## ZCode 桥接：本仓库的第二个工具
 
-如果你的协作对象是 **ZCode** 而不是 WorkBuddy，同仓库的
-[`zcode-bridge/`](zcode-bridge/README.md) 子目录提供了对等的工具：外部 agent
-用 `--resume <sessionId>` **借用 ZCode 已有会话的完整上下文**接着聊（实测不 fork、
-跨进程上下文召回、桌面端创建的会话同样能续），也带忙闲检测。
+如果协作对象是 **ZCode**（而不是 WorkBuddy），不用另找工具——同仓库的
+[`zcode-bridge/`](zcode-bridge/README.md) 子目录提供了对等的桥接：
 
-两者的分工：**WorkBuddy 桥接**追求“消息实时显示在界面”，**ZCode 桥接**追求
-“用上指定会话的上下文把结果拿回来”。
+```bash
+python zcode-bridge/zcode_send.py --list                              # 列会话（含 busy 标记）
+python zcode-bridge/zcode_send.py --session-id sess_xxx --msg "..."    # 借用指定会话上下文续聊
+python zcode-bridge/zcode_send.py --cwd "C:\path\to\project" --msg "..."  # 按项目目录自动取会话
+```
+
+它走 ZCode 官方的 `--resume <sessionId>` 续聊机制，**实测不 fork**（就在原会话
+追加，sessionId 不变）、跨进程上下文召回成功、桌面端创建的会话同样能续。
+繁忙检测同样有，且**输出格式和本桥接完全一致**（`IDLE|...` / `BUSY|...`，
+退出码 0/4），调用方可以用同一套解析逻辑对接两个目标。
+
+### 两个桥接怎么选
+
+| | WorkBuddy 桥接 | ZCode 桥接 |
+|---|---|---|
+| **投递目标** | WorkBuddy（CodeBuddy Code）PC 客户端 | ZCode 桌面端 / CLI |
+| **核心机制** | 直连 daemon 的 interactive session，走 ACP 协议 | CLI `--resume`，官方续聊机制 |
+| **界面实时刷新** | ✅ 消息实时显示在客户端对话界面 | ❌ 追加轮次需重新点开该会话才见 |
+| **借用上下文** | ✅ 用会话已有上下文 | ✅ 同样用会话已有上下文 |
+| **依赖** | PC 客户端在运行 + 会话已激活（可 `--ensure` 自动激活） | ZCode 已安装 + 会话库可读 |
+| **典型场景** | 人工在环：让用户在界面上看到外部 agent 的投递 | 无人值守：借上下文把活干完、把结果拿回来 |
+
+一句话：**要“看得见”用 WorkBuddy 桥接，要“接着干”用 ZCode 桥接。**
+完整说明见 [`zcode-bridge/README.md`](zcode-bridge/README.md)。
