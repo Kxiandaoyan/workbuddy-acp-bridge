@@ -23,6 +23,7 @@ unless --force-busy.
 """
 import argparse
 import base64
+import glob
 import json
 import os
 import re
@@ -53,6 +54,227 @@ def load_backends():
         {"profile": b.get("profile") or "?", "pid": b.get("pid"), "command": b.get("command") or ""}
         for b in data.get("backends", [])
     ]
+
+
+DESKTOP_HINT_KEY = b"hermes.desktop.sessionOwnerHints.v1"
+LAST_SESSION_KEY = b"hermes.desktop.lastSessionId.profile."
+
+
+def _varint(buf, pos):
+    result, shift = 0, 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return result, pos
+        shift += 7
+
+
+def _snappy_decompress(data):
+    declared, pos = _varint(data, 0)
+    if declared == 0 or declared > 64 * 1024 * 1024:
+        raise ValueError("bad declared length")
+    out = bytearray()
+    n = len(data)
+    while pos < n and len(out) < declared:
+        tag = data[pos]
+        t = tag & 0x03
+        if t == 0:
+            ln = (tag >> 2) + 1
+            hdr = 1
+            if ln > 60:
+                extra = ln - 60
+                ln = int.from_bytes(data[pos + 1:pos + 1 + extra], "little") + 1
+                hdr = 1 + extra
+            if pos + hdr + ln > n:
+                raise ValueError("literal overrun")
+            out += data[pos + hdr:pos + hdr + ln]
+            pos += hdr + ln
+        else:
+            if t == 1:
+                ln = ((tag >> 2) & 0x07) + 4
+                off = ((tag >> 5) << 8) | data[pos + 1]
+                pos += 2
+            elif t == 2:
+                ln = (tag >> 2) + 1
+                off = int.from_bytes(data[pos + 1:pos + 3], "little")
+                pos += 3
+            else:
+                ln = (tag >> 2) + 1
+                off = int.from_bytes(data[pos + 1:pos + 5], "little")
+                pos += 5
+            if off == 0 or off > len(out):
+                raise ValueError("bad copy offset")
+            for _ in range(ln):
+                out.append(out[len(out) - off])
+    if len(out) != declared:
+        raise ValueError("length mismatch")
+    return bytes(out)
+
+
+def _block_entries(blk):
+    """(key, value) pairs from one leveldb block (prefix-compressed)."""
+    import struct as _s
+    if len(blk) < 4:
+        return
+    nrest = _s.unpack("<I", blk[-4:])[0]
+    data_end = len(blk) - 4 - 4 * nrest
+    p, prev = 0, b""
+    while p < data_end:
+        shared, p = _varint(blk, p)
+        non_shared, p = _varint(blk, p)
+        vlen, p = _varint(blk, p)
+        delta = blk[p:p + non_shared]
+        p += non_shared
+        val = blk[p:p + vlen]
+        p += vlen
+        key = prev[:shared] + delta
+        prev = key
+        yield key, val
+
+
+_LDB_MAGIC = bytes.fromhex("57fb808b247547db")
+
+
+def _read_ldb_pairs(path):
+    """(key, value) across all data blocks of an .ldb (SSTable) file."""
+    import struct as _s
+    try:
+        data = open(path, "rb").read()
+    except OSError:
+        return
+    footer = data[-48:]
+    if footer[-8:] != _LDB_MAGIC:
+        return
+    try:
+        p = 0
+        _mo, p = _varint(footer, p)
+        _ms, p = _varint(footer, p)
+        io_, p = _varint(footer, p)
+        is_, p = _varint(footer, p)
+    except (IndexError, ValueError):
+        return
+
+    def load(off, size):
+        raw = data[off:off + size]
+        ctype = data[off + size] if off + size < len(data) else 0
+        if ctype == 1:
+            return _snappy_decompress(raw)
+        return raw
+
+    try:
+        index = load(io_, is_)
+    except Exception:
+        return
+    for _k, handle in _block_entries(index):
+        q = 0
+        boff, q = _varint(handle, q)
+        bsize, q = _varint(handle, q)
+        try:
+            blk = load(boff, bsize)
+        except Exception:
+            continue
+        yield from _block_entries(blk)
+
+
+def _read_log_batches(path):
+    """(key, value) pairs from a leveldb WAL (.log) file (write batches)."""
+    import struct as _s
+    try:
+        data = open(path, "rb").read()
+    except OSError:
+        return
+    pos, pending, n = 0, b"", len(data)
+    records = []
+    while pos + 7 <= n:
+        if (pos // 32768) > 0 and (pos % 32768) + 7 > 32768:
+            pos = ((pos // 32768) + 1) * 32768
+            continue
+        _crc, length, rtype = _s.unpack("<IHB", data[pos:pos + 7])
+        if rtype == 0 and length == 0:
+            pos = ((pos // 32768) + 1) * 32768
+            continue
+        payload = data[pos + 7:pos + 7 + length]
+        if len(payload) < length:
+            break
+        pos += 7 + length
+        if rtype == 1:
+            records.append(pending + payload)
+            pending = b""
+        elif rtype in (2, 3):
+            pending += payload
+        elif rtype == 4:
+            records.append(pending + payload)
+            pending = b""
+    for rec in records:
+        if len(rec) < 12:
+            continue
+        count = _s.unpack("<I", rec[8:12])[0]
+        p = 12
+        for _ in range(count):
+            if p >= len(rec):
+                break
+            op = rec[p]
+            p += 1
+            try:
+                klen, p = _varint(rec, p)
+                key = rec[p:p + klen]
+                p += klen
+                if op == 1:
+                    vlen, p = _varint(rec, p)
+                    val = rec[p:p + vlen]
+                    p += vlen
+                    yield key, val
+                else:
+                    yield key, None
+            except (IndexError, ValueError):
+                break
+
+
+def _decode_ls_value(val):
+    if not val:
+        return ""
+    enc, rest = val[0], val[1:]
+    if enc == 0:
+        return rest.decode("utf-16-le", "replace")
+    return rest.decode("utf-8", "replace")
+
+
+def desktop_open_sessions():
+    """{profile: session_id} for the session each Desktop window has open.
+
+    Reads `hermes.desktop.lastSessionId.profile.<name>` from the Desktop
+    renderer's localStorage leveldb (SSTables + WAL, newest write wins by
+    file order). Pure-stdlib leveldb/snappy parsing — no external tools.
+    """
+    base = os.path.join(
+        os.environ.get("APPDATA") or os.path.expanduser("~"),
+        "Hermes", "Local Storage", "leveldb")
+    out = {}
+    try:
+        files = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for name in files:
+        path = os.path.join(base, name)
+        pairs = _read_ldb_pairs(path) if name.endswith(".ldb") else (
+            _read_log_batches(path) if name.endswith(".log") else ())
+        for key, val in pairs:
+            if not key or LAST_SESSION_KEY not in key:
+                continue
+            try:
+                tail = key.split(b"\x00\x01", 1)[1]
+                prof = tail[len(LAST_SESSION_KEY):].split(b"\x01")[0].decode("utf-8", "replace")
+            except (IndexError, UnicodeDecodeError):
+                continue
+            if val is None:
+                out.pop(prof, None)
+                continue
+            sid = _decode_ls_value(val).strip()
+            if re.match(r"^\d{8}_\d{6}_[0-9A-Za-z]+$", sid):
+                out[prof] = sid
+    return out
 
 
 def _proc_cmdlines():
@@ -407,13 +629,63 @@ def main():
                 sys.exit(2)
             print(f"[backend] port={chosen['port']} profile={chosen['profile']}", file=sys.stderr)
         else:
-            gw = Gateway(candidates[0]["port"])
-            res = gw.call("session.most_recent")
-            target = res.get("result", {}).get("session_id")
+            # Target priority: (1) LIVE session on the profile's backend — the
+            # one the Desktop window currently has open; (2) Desktop's owner
+            # hints (last-opened per profile, from localStorage); (3) most_recent.
+            # most_recent alone is WRONG for "what the user is looking at": it's
+            # just the latest DB row (often a telegram/cron session).
+            gw = None
+            hinted = None
+            if not args.port and candidates[0].get("pid"):
+                pass  # multi-backend; locate below
+            for c in candidates:
+                try:
+                    g = Gateway(c["port"])
+                    live = g.call("session.active_list", timeout=15).get("result", {}).get("sessions", [])
+                except Exception:
+                    continue
+                if live:
+                    g2 = g if gw is None else None
+                    if gw is None:
+                        gw, chosen = g, c
+                    else:
+                        g.close()
+                    # most recently active live session on this backend
+                    best = max(live, key=lambda r: float(r.get("last_active") or 0))
+                    hinted = best.get("session_key") or best.get("id")
+                    print(f"[target] live-open ({c['profile']}) -> {hinted} "
+                          f"(status={best.get('status')})", file=sys.stderr)
+                    break
+                else:
+                    g.close()
+            if hinted is None:
+                open_map = desktop_open_sessions()
+                prof = args.profile or next(
+                    (c["profile"] for c in candidates if c["profile"] not in ("(unknown)", "(explicit)")), None)
+                hinted = open_map.get(prof) if prof else None
+                if hinted:
+                    print(f"[target] desktop-hint ({prof}) -> {hinted}", file=sys.stderr)
+            if gw is None:
+                gw = Gateway(candidates[0]["port"])
+            if hinted:
+                target = hinted
+                # verify it exists on this backend (cross-backend case)
+                res = gw.call("session.list", {"limit": 200}, timeout=20)
+                known = {s.get("id") for s in res.get("result", {}).get("sessions", [])}
+                if target not in known:
+                    # hint may point at another backend's session
+                    gw2, c2 = (None, None)
+                    gw2, c2 = _gateway_for_session(candidates, target) if "_gateway_for_session" in dir() else (None, None)
+                    if gw2:
+                        gw.close()
+                        gw = gw2
             if not target:
-                print("ERROR|没有可用的会话。|", file=sys.stderr)
-                sys.exit(2)
-            print(f"[target] most_recent -> {target}", file=sys.stderr)
+                res = gw.call("session.most_recent")
+                target = res.get("result", {}).get("session_id")
+                if not target:
+                    print("ERROR|没有可用的会话。|", file=sys.stderr)
+                    sys.exit(2)
+                print(f"[target] most_recent -> {target}", file=sys.stderr)
 
         busy, why = busy_check(gw, target)
         if busy and args.msg and args.force_busy:

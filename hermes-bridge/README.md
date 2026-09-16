@@ -46,9 +46,23 @@ python hermes_send.py --session-id <sid> --msg "..." --force-busy     # 忙时�
 ```
 
 **多 profile 说明**：Desktop 会为每个 profile spawn 一个独立的 `hermes serve`
-后端。`--profile` 按 serve 进程命令行里的 `--profile <name>` 匹配（Windows 上
-经 CIM 读取；受限沙箱里降级为 `(unknown)`，此时用 `--session-id` 跨后端自动
-定位更可靠——工具会遍历所有后端找到拥有该会话的那个）。
+后端（不活跃时会被回收）。`--profile` 按 serve 进程命令行里的
+`--profile <name>` 匹配（Windows 上经 CIM 读取；受限沙箱里降级为
+`(unknown)`，此时用 `--session-id` 跨后端自动定位更可靠）。
+
+**目标会话怎么选**（不带 `--session-id` 时，按优先级）：
+
+1. **live 会话**——该 profile 后端 gateway 内存里活跃的（= Desktop 窗口当前
+   打开且在用的），发这里**实时显示**；
+2. **`hermes.desktop.lastSessionId.profile.<name>`**——Desktop 渲染进程
+   localStorage 记录的"该 profile 上次打开的会话"（工具自带纯标准库的
+   leveldb/SSTable + snappy 解析器直接读 `%APPDATA%/Hermes`，无外部依赖）；
+3. **`session.most_recent`**——DB 最近一行（兜底；可能是 telegram/cron
+   来源，不一定是用户正看着的）。
+
+> **注意**：发 most_recent 是"发错会话"的常见来源——外部 agent 投递请尽量
+> 显式 `--session-id`，或确认 1/2 级目标命中（stderr 会打印
+> `[target] live-open (...)` / `[target] desktop-hint (...)` 供核对）。
 
 **DB-only 会话自动激活**：目标会话若没在 Desktop 里打开过（gateway 内存里
 没有），`prompt.submit` 会报 `session not found`——工具自动先 `session.resume`
