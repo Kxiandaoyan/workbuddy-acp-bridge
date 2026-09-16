@@ -35,14 +35,24 @@ WS /api/ws?token=...  →  JSON-RPC
 ## 用法
 
 ```bash
-python hermes_send.py --list                                  # 列后端 + 会话
+python hermes_send.py --list                                  # 列所有后端 + 会话
+python hermes_send.py --profile <name> --list                 # 指定 profile 的会话
+python hermes_send.py --profile <name> --check                # 查该 profile 最近会话忙闲
+python hermes_send.py --profile <name> --msg "消息"            # 发到该 profile 最近会话
 python hermes_send.py --session-id <sid> --check              # 只查忙闲
-python hermes_send.py --session-id <sid> --msg "消息"          # 发消息
-python hermes_send.py --profile <name> --list                 # 指定 profile
-python hermes_send.py --msg "..."                             # 默认发最近会话
-python hermes_send.py --session-id <sid> --msg "..." --wait-idle 60
-python hermes_send.py --session-id <sid> --msg "..." --force-busy
+python hermes_send.py --session-id <sid> --msg "消息"          # 发消息（跨后端自动定位）
+python hermes_send.py --session-id <sid> --msg "..." --wait-idle 60   # 忙时等待
+python hermes_send.py --session-id <sid> --msg "..." --force-busy     # 忙时也发（会重定向在跑的 turn）
 ```
+
+**多 profile 说明**：Desktop 会为每个 profile spawn 一个独立的 `hermes serve`
+后端。`--profile` 按 serve 进程命令行里的 `--profile <name>` 匹配（Windows 上
+经 CIM 读取；受限沙箱里降级为 `(unknown)`，此时用 `--session-id` 跨后端自动
+定位更可靠——工具会遍历所有后端找到拥有该会话的那个）。
+
+**DB-only 会话自动激活**：目标会话若没在 Desktop 里打开过（gateway 内存里
+没有），`prompt.submit` 会报 `session not found`——工具自动先 `session.resume`
+把它拉成 live（与用户在 Desktop 里点开一个历史会话完全同路径），再发送。
 
 **忙闲输出约定**（与 WorkBuddy / ZCode 桥接一致）：
 

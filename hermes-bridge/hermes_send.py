@@ -55,6 +55,33 @@ def load_backends():
     ]
 
 
+def _proc_cmdlines():
+    """pid -> command line for python.exe processes via PowerShell CIM.
+    Returns {} when unavailable (e.g. restricted sandboxes); callers fall back."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+             "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"],
+            capture_output=True, timeout=20, check=False).stdout.decode(errors="replace")
+        mapping = {}
+        for ln in out.splitlines():
+            if "|" not in ln:
+                continue
+            pid_s, cmd = ln.split("|", 1)
+            pid_s = pid_s.strip()
+            if pid_s.isdigit() and cmd.strip():
+                mapping[int(pid_s)] = cmd.strip()
+        return mapping
+    except Exception:
+        return {}
+
+
+def _profile_from_cmdline(cmd):
+    m = re.search(r"--profile[ =](\S+)", cmd or "")
+    return m.group(1) if m else None
+
+
 def _loopback_listeners():
     """[(port, pid)] of all loopback LISTENING sockets via netstat."""
     try:
@@ -73,6 +100,19 @@ def _loopback_listeners():
     return out_list
 
 
+def _ports_with_owner(pid, cmdlines=None):
+    """Loopback LISTENING ports owned by pid OR any descendant python serve
+    process (shim -> real server). Uses netstat only; the child set comes from
+    cmdline python processes whose parent chain we approximate by matching
+    `--profile ... serve` pythons via CIM when available."""
+    ports = {p for p, owner in _loopback_listeners() if owner == pid}
+    if ports or cmdlines is None:
+        return sorted(ports)
+    # CIM available: also count every python serve process's listener that is
+    # NOT claimed by an owned pid directly (the real servers behind shims).
+    return sorted(ports)
+
+
 def _is_hermes_backend(port, timeout=2.0):
     """Probe GET / : hermes serve (headless) returns the token page."""
     try:
@@ -84,16 +124,30 @@ def _is_hermes_backend(port, timeout=2.0):
 
 
 def listening_ports(pid):
-    """Hermes backend ports associated with pid OR its serve child (netstat-only:
-    wmic is gone on modern Windows and spawning powershell from python is blocked
-    in some sandboxes; we scan listeners and probe instead)."""
-    candidates = [p for p, owner in _loopback_listeners() if owner == pid]
-    if candidates:
-        return sorted(set(candidates))
-    # shim does not listen itself: its python child does. Probe every loopback
-    # listener for the hermes token page and return matches (cannot tie to pid
-    # without CIM, but the token page IS the hermes fingerprint).
+    """Hermes backend ports associated with pid (netstat-only fallback: probe
+    loopback listeners for the hermes token page when the shim itself doesn't
+    listen)."""
+    direct = [p for p, owner in _loopback_listeners() if owner == pid]
+    if direct:
+        return sorted(set(direct))
     return [p for p, _ in _loopback_listeners() if _is_hermes_backend(p)][:8]
+
+
+def _ports_with_owner(pid, cmdlines):
+    """Loopback LISTENING ports owned by pid; when the shim doesn't listen
+    itself, include hermes-token listeners owned by a `hermes ... serve` python
+    (the real server the shim spawned)."""
+    direct = [p for p, owner in _loopback_listeners() if owner == pid]
+    if direct:
+        return sorted(set(direct))
+    hits = []
+    for p, owner in _loopback_listeners():
+        if not _is_hermes_backend(p):
+            continue
+        cmd = (cmdlines or {}).get(owner, "")
+        if re.search(r"hermes_cli\.main.*serve", cmd):
+            hits.append(p)
+    return sorted(set(hits))[:8]
 
 
 def fetch_token(port, timeout=5.0):
@@ -248,9 +302,25 @@ def discover(args):
     if args.port:
         candidates = [{"profile": "(explicit)", "pid": None, "port": args.port}]
     else:
-        for b in load_backends():
-            for p in listening_ports(b["pid"]):
-                candidates.append({**b, "port": p})
+        # 1) ownership file: authoritative while Desktop tracks the backend
+        owned = {(b["pid"]): b for b in load_backends()}
+        # 2) CIM command lines give the TRUE profile of every listening serve
+        #    process (both Desktop's shim and the real server child carry
+        #    `--profile <name>` in their command line)
+        cmdlines = _proc_cmdlines()
+        seen_ports = set()
+        for p, owner in _loopback_listeners():
+            if not _is_hermes_backend(p):
+                continue
+            cmd = cmdlines.get(owner, "")
+            prof = _profile_from_cmdline(cmd)
+            if prof is None:
+                # listener's cmdline unknown (sandbox): try ownership shims
+                prof = next((b["profile"] for b in owned.values()
+                             if _profile_from_cmdline(b.get("command", "")) and owner == b["pid"]),
+                            "(unknown)")
+            candidates.append({"profile": prof, "pid": owner, "port": p})
+            seen_ports.add(p)
     if not candidates:
         print("ERROR|没有找到在跑的 Hermes 后端（backend-ownership.json 或端口发现失败）。|",
               file=sys.stderr)
@@ -258,7 +328,8 @@ def discover(args):
     if args.profile:
         hit = [c for c in candidates if c["profile"] == args.profile]
         if not hit:
-            print(f"ERROR|profile {args.profile!r} 不在 backend-ownership.json 里。|", file=sys.stderr)
+            known = sorted({c["profile"] for c in candidates})
+            print(f"ERROR|profile {args.profile!r} 未发现。已知: {known}|", file=sys.stderr)
             sys.exit(2)
         candidates = hit
     return candidates
@@ -301,9 +372,42 @@ def main():
 
     target = args.session_id
     gw = None
+
+    def _gateway_for_session(cands, sid):
+        """Find the backend whose session list contains sid (multi-backend setups:
+        Desktop spawns one serve per profile; ownership may only track the active one)."""
+        errors = []
+        for c in cands:
+            try:
+                g = Gateway(c["port"])
+            except Exception as e:
+                errors.append(f"{c['port']}: {e}")
+                continue
+            res = g.call("session.list", {"limit": 200}, timeout=20)
+            if res.get("error"):
+                g.close()
+                continue
+            for s in res.get("result", {}).get("sessions", []):
+                if sid == s.get("id"):
+                    return g, c
+            # also live runtime ids
+            res = g.call("session.active_list", timeout=15)
+            for row in res.get("result", {}).get("sessions", []):
+                if sid in (row.get("id"), row.get("session_key")):
+                    return g, c
+            g.close()
+        return None, None
+
     try:
-        gw = Gateway(candidates[0]["port"])
-        if not target:
+        if target:
+            gw, chosen = _gateway_for_session(candidates, target)
+            if gw is None:
+                # maybe a live-only runtime id on a backend with an empty DB list
+                print(f"ERROR|在 {len(candidates)} 个后端里都没找到会话 {target}。|", file=sys.stderr)
+                sys.exit(2)
+            print(f"[backend] port={chosen['port']} profile={chosen['profile']}", file=sys.stderr)
+        else:
+            gw = Gateway(candidates[0]["port"])
             res = gw.call("session.most_recent")
             target = res.get("result", {}).get("session_id")
             if not target:
@@ -332,6 +436,17 @@ def main():
             sys.exit(4)
 
         res = gw.call("prompt.submit", {"session_id": target, "text": args.msg}, timeout=30)
+        if res.get("error") and res["error"].get("code") == 4001:
+            # DB-only session (not open in the desktop): bring it live exactly
+            # like the desktop does when the user clicks a stored conversation.
+            r2 = gw.call("session.resume", {"session_id": target}, timeout=60)
+            if r2.get("error"):
+                print(f"ERROR|resume 失败:{r2['error'].get('message')}|session={target}", file=sys.stderr)
+                sys.exit(3)
+            live_id = r2.get("result", {}).get("session_id") or target
+            if live_id != target:
+                print(f"[resume] runtime id {live_id}", file=sys.stderr)
+            res = gw.call("prompt.submit", {"session_id": live_id, "text": args.msg}, timeout=30)
         if res.get("error"):
             print(f"ERROR|发送失败:{res['error'].get('message')}|session={target}", file=sys.stderr)
             sys.exit(3)
