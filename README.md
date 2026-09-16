@@ -149,3 +149,13 @@ POST /api/v1/acp           session/prompt {sessionId, prompt:[{type:"text",text:
 ## 许可
 
 MIT。
+
+## 相关：ZCode 桥接（[`zcode-bridge/`](zcode-bridge/README.md)）
+
+如果你的协作对象是 **ZCode** 而不是 WorkBuddy，同仓库的
+[`zcode-bridge/`](zcode-bridge/README.md) 子目录提供了对等的工具：外部 agent
+用 `--resume <sessionId>` **借用 ZCode 已有会话的完整上下文**接着聊（实测不 fork、
+跨进程上下文召回、桌面端创建的会话同样能续），也带忙闲检测。
+
+两者的分工：**WorkBuddy 桥接**追求“消息实时显示在界面”，**ZCode 桥接**追求
+“用上指定会话的上下文把结果拿回来”。
