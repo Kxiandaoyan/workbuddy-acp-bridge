@@ -1,22 +1,25 @@
-# Agent Bridges（WorkBuddy / ZCode）
+# Agent Bridges（WorkBuddy / ZCode / Hermes）
 
-**本仓库提供两个桥接工具，让其他 agent（Claude、Codex、Hermes、OpenClaw 等）
+**本仓库提供三个桥接工具，让其他 agent（Claude、Codex、Hermes、OpenClaw 等）
 投递消息到用户桌面上已经打开、已有完整上下文的会话——不用新开会话、不用重讲背景。**
 
 | 桥接 | 投递目标 | 一句话定位 | 入口 |
 |---|---|---|---|
 | **WorkBuddy 桥接** | WorkBuddy（CodeBuddy Code）PC 客户端 | 消息**实时显示**在客户端界面，用户看得见 | [`acp_live_send.py`](#文件)（本目录） |
 | **ZCode 桥接** | ZCode 桌面端 / CLI | **借用指定会话的上下文**接着干，把结果拿回来 | [`zcode-bridge/`](zcode-bridge/README.md)（子目录） |
+| **Hermes 桥接** | Hermes Desktop（NousResearch hermes-agent） | 消息**实时显示**在桌面端界面（多客户端 fan-out） | [`hermes-bridge/`](hermes-bridge/README.md)（子目录） |
 
-两者都用 Python 标准库写成、零依赖、都带忙闲检测，且**忙闲输出格式完全一致**
+三者都用 Python 标准库写成、零依赖、都带忙闲检测，且**忙闲输出格式完全一致**
 （`IDLE|...` / `BUSY|现在会话正忙，请稍后再发。|...`，退出码 0/4），
-调用方可以用同一套逻辑对接两个目标。按需选一个：
+调用方可以用同一套逻辑对接任意目标。按需选一个：
 
-- 想让用户**在界面上实时看到**外部 agent 发来的消息 → WorkBuddy 桥接
+- 想让用户**在 WorkBuddy 界面上实时看到**外部 agent 发来的消息 → WorkBuddy 桥接
 - 只想让外部 agent **用上某会话的上下文把活干完、把结果拿回来** → ZCode 桥接
+- 想给 **Hermes Desktop** 里打开的会话发消息（实时显示 + 原上下文干活）→ Hermes 桥接
 
-> 下文是 **WorkBuddy 桥接**的完整说明；ZCode 桥接的用法见
-> [`zcode-bridge/README.md`](zcode-bridge/README.md)。
+> 下文是 **WorkBuddy 桥接**的完整说明；ZCode 桥接见
+> [`zcode-bridge/README.md`](zcode-bridge/README.md)，Hermes 桥接见
+> [`hermes-bridge/README.md`](hermes-bridge/README.md)。
 
 ---
 
@@ -58,7 +61,9 @@ PC 客户端对话界面实时显示消息 + WorkBuddy agent 的回复
 | `acp_live_test.py` | 最小冒烟测试（手动传端口），用来单独验证 ACP 四步调用链。 |
 | `zcode-bridge/zcode_send.py` | **ZCode 桥接核心工具**。按 sessionId 或项目目录进入指定会话续聊（`--resume`），借用完整上下文。 |
 | `zcode-bridge/README.md` | ZCode 桥接的完整文档（原理 / 繁忙检测 / 与本桥接的分工）。 |
-| `README.md` | 本文档（两个桥接的总说明 + WorkBuddy 桥接详细用法）。 |
+| `hermes-bridge/hermes_send.py` | **Hermes 桥接核心工具**。发现 Desktop 的 serve 后端 → WS JSON-RPC `prompt.submit`，消息实时进桌面端会话。 |
+| `hermes-bridge/README.md` | Hermes 桥接的完整文档（架构 / 发现链 / busy 语义 / 多客户端安全）。 |
+| `README.md` | 本文档（三个桥接的总说明 + WorkBuddy 桥接详细用法）。 |
 
 ## 用法
 
@@ -190,16 +195,17 @@ python zcode-bridge/zcode_send.py --cwd "C:\path\to\project" --msg "..."  # 按�
 繁忙检测同样有，且**输出格式和本桥接完全一致**（`IDLE|...` / `BUSY|...`，
 退出码 0/4），调用方可以用同一套解析逻辑对接两个目标。
 
-### 两个桥接怎么选
+### 三个桥接怎么选
 
-| | WorkBuddy 桥接 | ZCode 桥接 |
-|---|---|---|
-| **投递目标** | WorkBuddy（CodeBuddy Code）PC 客户端 | ZCode 桌面端 / CLI |
-| **核心机制** | 直连 daemon 的 interactive session，走 ACP 协议 | CLI `--resume`，官方续聊机制 |
-| **界面实时刷新** | ✅ 消息实时显示在客户端对话界面 | ❌ 追加轮次需重新点开该会话才见 |
-| **借用上下文** | ✅ 用会话已有上下文 | ✅ 同样用会话已有上下文 |
-| **依赖** | PC 客户端在运行 + 会话已激活（可 `--ensure` 自动激活） | ZCode 已安装 + 会话库可读 |
-| **典型场景** | 人工在环：让用户在界面上看到外部 agent 的投递 | 无人值守：借上下文把活干完、把结果拿回来 |
+| | WorkBuddy 桥接 | ZCode 桥接 | Hermes 桥接 |
+|---|---|---|---|
+| **投递目标** | WorkBuddy（CodeBuddy Code）PC 客户端 | ZCode 桌面端 / CLI | Hermes Desktop（hermes-agent） |
+| **核心机制** | 直连 daemon 的 interactive session，走 ACP 协议 | CLI `--resume`，官方续聊机制 | Desktop 自带 serve 后端的 WS JSON-RPC `prompt.submit` |
+| **界面实时刷新** | ✅ 消息实时显示在客户端对话界面 | ❌ 追加轮次需重新点开该会话才见 | ✅ 多客户端 fan-out，桌面端实时显示 |
+| **借用上下文** | ✅ 用会话已有上下文 | ✅ 同样用会话已有上下文 | ✅ 原会话上下文继续干活 |
+| **依赖** | PC 客户端在运行 + 会话已激活（可 `--ensure` 自动激活） | ZCode 已安装 + 会话库可读 | Hermes Desktop 在运行（它 spawn serve 后端） |
+| **典型场景** | 人工在环：让用户在界面上看到外部 agent 的投递 | 无人值守：借上下文把活干完、把结果拿回来 | 跨 agent 协作：给 Hermes fleet 里的活跃会话派活 |
 
-一句话：**要“看得见”用 WorkBuddy 桥接，要“接着干”用 ZCode 桥接。**
-完整说明见 [`zcode-bridge/README.md`](zcode-bridge/README.md)。
+一句话：**要“看得见”用 WorkBuddy/Hermes 桥接，要“接着干”用 ZCode 桥接。**
+完整说明见 [`zcode-bridge/README.md`](zcode-bridge/README.md) 与
+[`hermes-bridge/README.md`](hermes-bridge/README.md)。
