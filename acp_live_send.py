@@ -1,26 +1,39 @@
 #!/usr/bin/env python
 """
-acp_live_send.py -- Send a message into a LIVE WorkBuddy PC-client conversation
+acp_live_send.py v2 -- Send a message into a LIVE WorkBuddy PC-client conversation
 so it appears in the PC client UI in REAL TIME.
 
-Key insight (2026-09-16): the PC client's own daemon (daemon-app-server-entry.js
---stdio, child of WorkBuddy.exe main process) owns "interactive" ACP sessions
-spawned from its prewarm pool. Sending session/prompt to THAT session's
-/api/v1/acp endpoint updates the PC client's conversation and the daemon pushes
-wb:event -> main -> renderer -> live UI update.
+Architecture (verified 2026-09-16, from app.asar forensics): the PC client's
+daemon (daemon-app-server-entry.js, child of WorkBuddy.exe) owns "interactive"
+ACP sessions from its prewarm pool. POST /api/v1/acp/connect is loopback-exempt
+(no password); session/prompt on that endpoint streams through the daemon to the
+UI (wb:event -> main -> renderer).
 
-The ACP main channel /api/v1/acp is loopback-exempt (AcpSecurityMiddleware),
-and POST /api/v1/acp/connect issues a fresh connectionId + sessionToken with NO
-password. This is the channel "their app" uses -- NOT the separate
-`codebuddy --serve` daemon we used before (9527), which the PC client never
-subscribed to.
+v2 changes (2026-09-18, after "double answer + stall + low success rate"
+forensics on a 42MB session):
+  1. NO session/load before prompt. The interactive worker already has the
+     session loaded; session/load replays the whole history through the daemon
+     (HistoryLoaded / RequestsChanged full-snapshot re-render) which the user
+     sees as the agent "answering twice", and it stalls the daemon on huge
+     transcripts (Empty-stream timeouts -> error-recovery retries). The PC
+     client itself never loads before prompting (promptWithSessionResume).
+  2. Health-gated port discovery: every candidate port is probed with a real
+     POST /api/v1/acp/connect before use; stale ports (session recycled
+     minutes ago, registry row still present) answer 502 / refuse.
+  3. SSE early exit: return as soon as the turn is confirmed started (first
+     session_update frame). The UI has its own event stream; holding ours open
+     for the whole turn (up to 600s) only added load and timeouts.
+  4. Fallback: if the worker freshly recycled and genuinely lost the session
+     (prompt returns "not found"), do ONE session/load then retry once.
 
 Usage:
-  python acp_live_send.py --list
-  python acp_live_send.py --session-id <uuid> --cwd "D:\\hermes\\workbuddy" --msg "hello"
-  python acp_live_send.py --cwd "D:\\hermes\\workbuddy" --msg "hello"   # auto-pick session
+  python acp_live_send.py --list / --list-probe
+  python acp_live_send.py --session-id <uuid> --msg "hello"
+  python acp_live_send.py --session-id <uuid> --msg "hello" --ensure
+  python acp_live_send.py --session-id <uuid> --check
+  python acp_live_send.py --session-id <uuid> --msg "..." --wait-reply   # hold stream to turn end
 """
-import argparse, json, os, re, socket, subprocess, sys, time, urllib.request, urllib.error
+import argparse, json, os, re, subprocess, sys, time, urllib.request, urllib.error
 
 SESSIONS_DIR = os.path.expanduser("~/.workbuddy/sessions")
 
@@ -33,35 +46,12 @@ def _read_json(path):
     except Exception:
         return None
 
-def list_interactive_sessions():
-    """All live interactive sessions known by the registry."""
-    out = []
-    if not os.path.isdir(SESSIONS_DIR):
-        return out
-    for name in sorted(os.listdir(SESSIONS_DIR)):
-        if not name.endswith(".json"):
-            continue
-        rec = _read_json(os.path.join(SESSIONS_DIR, name))
-        if not rec or rec.get("kind") != "interactive":
-            continue
-        pid = rec.get("pid")
-        out.append({
-            "pid": pid,
-            "sessionId": rec.get("sessionId"),
-            "cwd": rec.get("cwd"),
-            "startedAt": rec.get("startedAt"),
-            "updatedAt": rec.get("updatedAt"),
-            "port": _listening_port(pid),
-        })
-    return out
-
-def _listening_port(pid):
-    """Best-effort: find 127.0.0.1 port LISTENING by pid (netstat via temp file)."""
-    if not pid:
-        return None
+def _netstat_snapshot():
+    """ONE netstat run -> {pid(str): [127.0.0.1 listen ports]}."""
     import tempfile
-    out = None
+    snap = {}
     tmp = None
+    out = ""
     try:
         tmp = tempfile.NamedTemporaryFile(mode="w+", suffix=".netstat", delete=False)
         tmp.close()
@@ -70,7 +60,7 @@ def _listening_port(pid):
         with open(tmp.name, "r", encoding="utf-8", errors="replace") as fh:
             out = fh.read()
     except Exception:
-        out = None
+        return snap
     finally:
         if tmp:
             try:
@@ -78,18 +68,62 @@ def _listening_port(pid):
             except Exception:
                 pass
     if not out:
-        return None
+        return snap
     for line in out.splitlines():
         parts = line.split()
         if len(parts) >= 5 and parts[0] == "TCP" and parts[3] == "LISTENING":
-            if parts[4] == str(pid):
-                m = re.match(r"127\.0\.0\.1:(\d+)", parts[1])
-                if m:
-                    return int(m.group(1))
-    return None
+            m = re.match(r"127\.0\.0\.1:(\d+)", parts[1])
+            if m:
+                snap.setdefault(parts[4], []).append(int(m.group(1)))
+    return snap
 
-def find_live_endpoint(session_id=None, cwd=None):
-    """Return (port, sessionId, cwd) for a live interactive session."""
+def _probe_acp(port, timeout=4):
+    """True when POST /api/v1/acp/connect answers 200 on this port."""
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d/api/v1/acp/connect" % port,
+        data=b"", method="POST",
+        headers={"Content-Type": "application/json", "x-codebuddy-request": "1"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+def list_interactive_sessions(probe=False):
+    """Live interactive sessions; probe=True health-checks each port via ACP."""
+    out = []
+    if not os.path.isdir(SESSIONS_DIR):
+        return out
+    snap = _netstat_snapshot()
+    for name in sorted(os.listdir(SESSIONS_DIR)):
+        if not name.endswith(".json"):
+            continue
+        rec = _read_json(os.path.join(SESSIONS_DIR, name))
+        if not rec or rec.get("kind") != "interactive":
+            continue
+        pid = rec.get("pid")
+        ports = snap.get(str(pid)) if pid else None
+        port = ports[0] if ports else None
+        entry = {
+            "pid": pid,
+            "sessionId": rec.get("sessionId"),
+            "cwd": rec.get("cwd"),
+            "startedAt": rec.get("startedAt"),
+            "updatedAt": rec.get("updatedAt"),
+            "port": port,
+            "healthy": None,
+        }
+        if probe and port:
+            entry["healthy"] = _probe_acp(port)
+        out.append(entry)
+    return out
+
+def find_live_endpoint(session_id=None, cwd=None, probe=True):
+    """(port, sessionId, cwd) for a live interactive session.
+
+    v2: when probe=True only trust a port that answers POST connect. Recycled
+    sessions leave stale registry rows whose port is dead or 502.
+    """
     cands = list_interactive_sessions()
     if session_id:
         cands = [c for c in cands if c["sessionId"] == session_id]
@@ -101,40 +135,43 @@ def find_live_endpoint(session_id=None, cwd=None):
     if not cands:
         return None
     cands.sort(key=lambda c: c.get("updatedAt") or c.get("startedAt") or 0)
-    best = cands[-1]
-    return best["port"], best["sessionId"], best.get("cwd")
+    for c in reversed(cands):  # newest first
+        if not probe or _probe_acp(c["port"]):
+            return c["port"], c["sessionId"], c.get("cwd")
+    return None
 
 # ---------------------------------------------------------------- activation
 
 def activate_via_deeplink(session_id, timeout=25):
     """Bring a conversation alive in the PC client without any manual click.
 
-    The client registers the `workbuddy://` URL scheme; opening
-    `workbuddy://chat/<sessionId>` focuses that conversation in the UI, and
-    the client's daemon then promotes a prewarm CLI process into an interactive
-    session for it (a live 127.0.0.1 port appears in the session registry).
+    workbuddy://chat/<sessionId> focuses that conversation; the daemon promotes
+    a prewarm CLI process into an interactive session (live port appears).
     Returns the live endpoint tuple, or None if it did not come up in time.
+    Note: this only works for conversations that still exist in the client's
+    list; a deleted/cleared conversation cannot be re-raised.
     """
     if not session_id:
         return None
     url = "workbuddy://chat/%s" % session_id
     try:
-        os.startfile(url)  # Windows: shell-execute the registered URL scheme
+        os.startfile(url)
     except Exception as e:
         print("activate: failed to open deep link: %s" % e)
         return None
-    deadline = time.time() + timeout
+    started = time.time()
+    deadline = started + timeout
     while time.time() < deadline:
-        time.sleep(2)
+        time.sleep(1.0)
         found = find_live_endpoint(session_id=session_id)
         if found:
+            print("activate: endpoint up after %.1fs (port=%s)" % (time.time() - started, found[0]))
             return found
     return None
 
 # ---------------------------------------------------------------- busy check
 
 def _project_key(cwd):
-    """D:\\hermes\\workbuddy -> d-hermes-workbuddy (drive letter lower + joined)."""
     p = (cwd or "").replace("\\", "/").strip("/")
     if not p:
         return None
@@ -155,13 +192,7 @@ _BUSY_STATUS = ("in_progress", "streaming", "running", "pending", "queued")
 _TERMINAL_STATUS = ("completed", "error", "cancelled", "interrupted", "failed")
 
 def _last_busy_state(cwd, session_id):
-    """Scan the transcript tail from the end; return (busy:bool, last_status:str).
-
-    Walks backwards over jsonl lines and picks the LAST record carrying a
-    "status" field (tool calls / assistant messages / request records all do).
-    If that status is non-terminal -> busy. A trailing user message with no
-    status (request just queued, agent not started yet) also counts as busy.
-    """
+    """Scan the transcript tail from the end; return (busy:bool, last_status:str)."""
     path = _transcript_path(cwd, session_id)
     if not path or not os.path.exists(path):
         return False, None
@@ -172,6 +203,9 @@ def _last_busy_state(cwd, session_id):
             tail = f.read().decode("utf-8", "replace")
     except Exception:
         return False, None
+    nl = tail.find("\n")  # align to a full line (seek may land mid-line)
+    if nl >= 0:
+        tail = tail[nl + 1:]
     lines = [l for l in tail.splitlines() if l.strip()]
     for line in reversed(lines):
         try:
@@ -186,25 +220,11 @@ def _last_busy_state(cwd, session_id):
             busy = any(s.startswith(b) for b in _BUSY_STATUS) and \
                    not any(s.startswith(t) for t in _TERMINAL_STATUS)
             return busy, s
-        # no status field: a bare user message at the tail = request queued,
-        # agent has not produced anything yet -> busy
         if rtype == "message" and role == "user":
             return True, "queued"
         if rtype == "function_call":
             return True, "running"
     return False, None
-
-def session_busy_via_transcript(cwd, session_id):
-    """True if the last request in the transcript has not reached a terminal
-    state. Terminal: completed / error / cancelled / interrupted."""
-    busy, _ = _last_busy_state(cwd, session_id)
-    return busy
-
-def session_busy(port, session_id, cwd=None, timeout=8):
-    """Combined busy check: transcript status (authoritative) + endpoint liveness."""
-    if cwd and session_busy_via_transcript(cwd, session_id):
-        return True
-    return False
 
 # ---------------------------------------------------------------- ACP client
 
@@ -220,7 +240,7 @@ class AcpClient:
         self._id += 1
         return self._id
 
-    def _post(self, path, body=None, headers=None, timeout=30, stream=False):
+    def _post(self, path, body=None, headers=None, timeout=30):
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -235,36 +255,6 @@ class AcpClient:
             return r.status, r
         except urllib.error.HTTPError as e:
             return e.code, e
-
-    def _read_sse(self, resp, max_bytes=None, idle_timeout=120):
-        """Read an SSE/chunked response to completion; tolerate truncation.
-
-        Returns (text, finished) where finished=True if we saw a terminal marker.
-        """
-        buf = []
-        total = 0
-        last = time.time()
-        finished = False
-        try:
-            while True:
-                if max_bytes is not None and total >= max_bytes:
-                    break
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                s = chunk.decode("utf-8", "replace")
-                buf.append(s)
-                total += len(chunk)
-                last = time.time()
-                if '"finishReason":"stop"' in s or '"outcome":"SUCCESS"' in s \
-                        or '"sessionUpdate":"session_end"' in s:
-                    finished = True
-                    break
-                if time.time() - last > idle_timeout:
-                    break
-        except Exception as e:
-            self.log("  [stream truncated: %s]" % e)
-        return "".join(buf), finished
 
     def connect(self):
         st, r = self._post("/api/v1/acp/connect", body=None, timeout=15)
@@ -288,126 +278,175 @@ class AcpClient:
         st, r = self._post("/api/v1/acp", {
             "jsonrpc": "2.0", "id": self._next_id(), "method": "initialize",
             "params": {"protocolVersion": 1,
-                       "clientInfo": {"name": "hermes-bridge", "version": "1.0.0"},
+                       "clientInfo": {"name": "acp-bridge", "version": "2.0.0"},
                        "clientCapabilities": {}}}, self._auth(), timeout=30)
-        text, _ = self._read_sse(r, max_bytes=200000)
-        return st, text
+        try:
+            r.read(200000)  # drain capability frames
+        except Exception:
+            pass
+        return st
+
+    def prompt(self, session_id, message, confirm_start=True, idle_timeout=20):
+        """session/prompt with v2 early-exit.
+
+        confirm_start=True  -> return once the first update frame arrives
+                               (turn confirmed running; UI streams it itself).
+        confirm_start=False -> read to terminal marker (finishReason stop).
+        Returns (http_status, text, ok).
+        """
+        st, r = self._post("/api/v1/acp", {
+            "jsonrpc": "2.0", "id": self._next_id(), "method": "session/prompt",
+            "params": {"sessionId": session_id,
+                       "prompt": [{"type": "text", "text": message}]}},
+            self._auth(), timeout=60)
+        if st != 200:
+            return st, "", False
+        buf = []
+        started = False
+        finished = False
+        last = time.time()
+        try:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                s = chunk.decode("utf-8", "replace")
+                buf.append(s)
+                last = time.time()
+                if not started and ('"sessionUpdate"' in s or '"user_message_chunk"' in s
+                                    or '"agent_message_chunk"' in s):
+                    started = True
+                    if confirm_start:
+                        break
+                if '"finishReason":"stop"' in s or '"outcome":"SUCCESS"' in s \
+                        or '"sessionUpdate":"session_end"' in s:
+                    finished = True
+                    break
+                if time.time() - last > idle_timeout:
+                    break
+        except Exception as e:
+            self.log("  [stream read ended: %s]" % e)
+        return st, "".join(buf), finished or started
 
     def load_session(self, session_id, cwd):
         st, r = self._post("/api/v1/acp", {
             "jsonrpc": "2.0", "id": self._next_id(), "method": "session/load",
             "params": {"sessionId": session_id, "cwd": cwd, "mcpServers": []}},
             self._auth(), timeout=60)
-        text, _ = self._read_sse(r, max_bytes=400000)
+        try:
+            text = r.read(400000).decode("utf-8", "replace")
+        except Exception:
+            text = ""
         return st, text
 
-    def prompt(self, session_id, message, timeout=600):
-        st, r = self._post("/api/v1/acp", {
-            "jsonrpc": "2.0", "id": self._next_id(), "method": "session/prompt",
-            "params": {"sessionId": session_id,
-                       "prompt": [{"type": "text", "text": message}]}},
-            self._auth(), timeout=timeout)
-        text, finished = self._read_sse(r, idle_timeout=120)
-        return st, text, finished
+# ---------------------------------------------------------------- send flow
 
-    def close(self):
-        if not self.conn_id:
-            return
+def send_message(session_id, message, cwd=None, ensure=False, wait_idle=0,
+                 retries=3, log=print):
+    """v2 flow: discover(health-gated) -> connect -> initialize -> prompt.
+
+    No session/load up front (double-render + stall forensics). One load+retry
+    only when the worker reports the session missing (fresh recycle).
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        found = find_live_endpoint(session_id=session_id, cwd=cwd, probe=True)
+        if not found:
+            if ensure and session_id and attempt == 1:
+                log("no live endpoint; activating via deep link...")
+                found = activate_via_deeplink(session_id)
+            if not found:
+                last_err = "no live endpoint"
+                time.sleep(2)
+                continue
+        port, sid, scwd = found
+        cwd = cwd or scwd
         try:
-            self._post("/api/v1/acp", None, self._auth(), timeout=5, stream=True)
-        except Exception:
-            pass
+            client = AcpClient(port, log=log)
+            client.connect()
+            client.initialize()
+
+            if cwd:
+                busy, last = _last_busy_state(cwd, sid)
+                if busy and wait_idle:
+                    deadline = time.time() + wait_idle
+                    while time.time() < deadline:
+                        time.sleep(2)
+                        busy, _ = _last_busy_state(cwd, sid)
+                        if not busy:
+                            break
+                if busy:
+                    return 4, "BUSY|现在会话正忙，请稍后再发。|session=%s|last_status=%s" % (sid, last)
+
+            st, text, ok = client.prompt(sid, message, confirm_start=True)
+            if st == 200 and ok:
+                return 0, "SENT|session=%s|port=%s|attempt=%d" % (sid, port, attempt)
+            # worker freshly recycled and lost the session? one load + retry
+            if st == 200 and "not found" in text.lower():
+                log("worker lost session; one session/load then retry...")
+                client.load_session(sid, cwd or "")
+                st, text, ok = client.prompt(sid, message, confirm_start=True)
+                if st == 200 and ok:
+                    return 0, "SENT|session=%s|port=%s|after-reload" % (sid, port)
+            last_err = "prompt HTTP %s ok=%s tail=%s" % (st, ok, text[-120:])
+        except Exception as e:
+            last_err = "%s: %s" % (type(e).__name__, e)
+        log("attempt %d/%d failed: %s" % (attempt, retries, last_err))
+        time.sleep(2)
+    return 2, "ERROR|%s|session=%s" % (last_err, session_id)
 
 # ---------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--list", action="store_true")
-    ap.add_argument("--check", action="store_true",
-                    help="only check busy state and print a status line; do not send")
+    ap.add_argument("--list-probe", action="store_true",
+                    help="list with per-port ACP health probe")
+    ap.add_argument("--check", action="store_true")
     ap.add_argument("--session-id")
     ap.add_argument("--cwd")
-    ap.add_argument("--msg", required=False)
-    ap.add_argument("--wait-idle", type=int, default=0,
-                    help="seconds to wait for session to become idle before sending")
+    ap.add_argument("--msg")
+    ap.add_argument("--wait-idle", type=int, default=0)
     ap.add_argument("--ensure", action="store_true",
-                    help="if no live endpoint exists, auto-activate the "
-                         "conversation via the workbuddy:// deep link first")
+                    help="auto-activate via workbuddy:// deep link (needs --session-id)")
     args = ap.parse_args()
 
-    if args.list:
-        rows = list_interactive_sessions()
+    if args.list or args.list_probe:
+        rows = list_interactive_sessions(probe=args.list_probe)
         if not rows:
             print("(no live interactive sessions)")
-            return
+            return 0
         for c in rows:
-            print("pid=%-6s port=%-6s session=%s cwd=%s" %
-                  (c["pid"], c["port"], c["sessionId"], c.get("cwd")))
-        return
+            health = "" if c["healthy"] is None else ("healthy" if c["healthy"] else "DEAD")
+            print("pid=%-6s port=%-6s %-7s session=%s cwd=%s" %
+                  (c["pid"], c["port"], health, c["sessionId"], c.get("cwd")))
+        return 0
 
-    if not args.msg and not args.check:
-        ap.error("--msg is required unless --list / --check")
-
-    found = find_live_endpoint(args.session_id, args.cwd)
-    if not found and args.ensure and args.session_id:
-        print("no live endpoint; activating %s via deep link..." % args.session_id)
-        found = activate_via_deeplink(args.session_id)
-        if not found:
-            print("ERROR: deep link did not bring up a live session for %s" %
-                  args.session_id, file=sys.stderr)
-            return 2
-    if not found:
-        print("ERROR: no live interactive session for session-id=%s cwd=%s" %
-              (args.session_id, args.cwd), file=sys.stderr)
-        print("available:", file=sys.stderr)
-        for c in list_interactive_sessions():
-            print("  pid=%s session=%s cwd=%s" % (c["pid"], c["sessionId"], c.get("cwd")), file=sys.stderr)
-        print("hint: pass --ensure to auto-activate the conversation via the "
-              "workbuddy:// deep link (requires --session-id)", file=sys.stderr)
-        return 2
-    port, session_id, cwd = found
-    print("live session: pid-port=%s session=%s cwd=%s" % (port, session_id, cwd))
-
-    # ---- busy gate (user requirement: don't barge into a running task)
-    if args.wait_idle:
-        deadline = time.time() + args.wait_idle
-        while time.time() < deadline:
-            busy, last = _last_busy_state(cwd, session_id)
-            if not busy:
-                break
-            print("waiting: session busy (last status=%s)..." % last)
-            time.sleep(2)
-
-    busy, last = _last_busy_state(cwd, session_id)
-    if busy:
-        # Clear, caller-relayable notice. Hermes should hand this line to the user.
-        print("BUSY|现在会话正忙，请稍后再发。|session=%s|last_status=%s" % (session_id, last))
-        return 4
+    if not args.session_id and not args.cwd:
+        ap.error("--session-id or --cwd required")
 
     if args.check:
-        print("IDLE|会话空闲，可以发送。|session=%s|last_status=%s" % (session_id, last))
+        found = find_live_endpoint(args.session_id, args.cwd, probe=True)
+        if not found and args.ensure and args.session_id:
+            found = activate_via_deeplink(args.session_id)
+        if not found:
+            print("ERROR: no live interactive session", file=sys.stderr)
+            return 2
+        port, sid, cwd = found
+        busy, last = _last_busy_state(cwd, sid)
+        if busy:
+            print("BUSY|现在会话正忙，请稍后再发。|session=%s|last_status=%s" % (sid, last))
+            return 4
+        print("IDLE|会话空闲，可以发送。|session=%s|last_status=%s" % (sid, last))
         return 0
 
     if not args.msg:
         ap.error("--msg is required")
 
-    client = AcpClient(port)
-    cid = client.connect()
-    print("connected: connectionId=%s" % cid)
-    st, text = client.initialize()
-    print("initialize: HTTP %s" % st)
-    st, text = client.load_session(session_id, cwd)
-    ok = '"error"' not in text
-    print("session/load: HTTP %s ok=%s" % (st, ok))
-    if not ok:
-        print(text[:600])
-        return 3
-    st, text, finished = client.prompt(session_id, args.msg)
-    print("session/prompt: HTTP %s finished=%s bytes=%d" % (st, finished, len(text)))
-    # show the tail of the agent reply
-    tail = text[-1200:]
-    print("--- tail ---")
-    print(tail)
+    code, line = send_message(args.session_id, args.msg, cwd=args.cwd,
+                              ensure=args.ensure, wait_idle=args.wait_idle)
+    print(line)
+    return code
 
 if __name__ == "__main__":
     sys.exit(main() or 0)
