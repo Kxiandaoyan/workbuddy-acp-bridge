@@ -567,8 +567,13 @@ def main():
     ap.add_argument("--check", action="store_true", help="busy-check only")
     ap.add_argument("--wait-idle", type=int, default=None, metavar="SEC",
                     help="if busy, poll every 2s up to SEC seconds before giving up")
+    ap.add_argument("--queue-busy", action="store_true",
+                    help="if busy, submit as the queued NEXT turn (queued:true, the "
+                         "desktop composer's own queue-drain semantics) instead of "
+                         "refusing — never interrupts/redirects the running turn")
     ap.add_argument("--force-busy", action="store_true",
-                    help="send even if busy (busy_input_mode may redirect the running turn)")
+                    help="send even if busy WITHOUT queueing (busy_input_mode may "
+                         "redirect the running turn — disruptive)")
     args = ap.parse_args()
 
     candidates = discover(args)
@@ -688,7 +693,9 @@ def main():
                 print(f"[target] most_recent -> {target}", file=sys.stderr)
 
         busy, why = busy_check(gw, target)
-        if busy and args.msg and args.force_busy:
+        if busy and args.msg and args.queue_busy:
+            pass  # queued submit below handles a running turn server-side
+        elif busy and args.msg and args.force_busy:
             print(f"[warn] busy ({why}) but --force-busy set; sending anyway", file=sys.stderr)
         elif busy and args.wait_idle:
             deadline = time.time() + args.wait_idle
@@ -703,11 +710,20 @@ def main():
             print(f"IDLE|{IDLE_MSG}|session={target}|{why}")
             return
 
-        if busy:
+        if busy and not (args.queue_busy or args.force_busy):
             print(f"BUSY|{BUSY_MSG}|session={target}|{why}")
             sys.exit(4)
 
-        res = gw.call("prompt.submit", {"session_id": target, "text": args.msg}, timeout=30)
+        # queued:true = the desktop's own queue-drain semantics: the server
+        # appends this as the NEXT turn without interrupting/redirecting the
+        # running one (mirrors the composer's fromQueue submit). This is the
+        # graceful unattended-delivery mode.
+        params = {"session_id": target, "text": args.msg}
+        if busy and args.queue_busy:
+            params["queued"] = True
+            print(f"[queue] busy ({why}); submitting as queued next-turn", file=sys.stderr)
+
+        res = gw.call("prompt.submit", params, timeout=30)
         if res.get("error") and res["error"].get("code") == 4001:
             # DB-only session (not open in the desktop): bring it live exactly
             # like the desktop does when the user clicks a stored conversation.
@@ -718,11 +734,13 @@ def main():
             live_id = r2.get("result", {}).get("session_id") or target
             if live_id != target:
                 print(f"[resume] runtime id {live_id}", file=sys.stderr)
-            res = gw.call("prompt.submit", {"session_id": live_id, "text": args.msg}, timeout=30)
+            params["session_id"] = live_id
+            res = gw.call("prompt.submit", params, timeout=30)
         if res.get("error"):
             print(f"ERROR|发送失败:{res['error'].get('message')}|session={target}", file=sys.stderr)
             sys.exit(3)
-        print(f"SENT|status={res.get('result', {}).get('status')}|session={target}")
+        status = res.get("result", {}).get("status")
+        print(f"SENT|status={status}|session={target}" + ("|queued" if params.get("queued") else ""))
     finally:
         if gw:
             gw.close()
