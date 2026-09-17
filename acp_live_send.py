@@ -286,30 +286,35 @@ class AcpClient:
             pass
         return st
 
-    def prompt(self, session_id, message, confirm_start=True, idle_timeout=20):
+    def prompt(self, session_id, message, confirm_start=True, first_frame_timeout=45,
+               idle_timeout=20):
         """session/prompt with v2 early-exit.
 
         confirm_start=True  -> return once the first update frame arrives
                                (turn confirmed running; UI streams it itself).
         confirm_start=False -> read to terminal marker (finishReason stop).
+        first_frame_timeout bounds how long we wait for ANY frame when none
+        has arrived yet (recycled workers send nothing and reset the socket —
+        WinError 10054; a stale empty stream must not block a full minute).
         Returns (http_status, text, ok).
         """
         st, r = self._post("/api/v1/acp", {
             "jsonrpc": "2.0", "id": self._next_id(), "method": "session/prompt",
             "params": {"sessionId": session_id,
                        "prompt": [{"type": "text", "text": message}]}},
-            self._auth(), timeout=60)
+            self._auth(), timeout=30)
         if st != 200:
             return st, "", False
         buf = []
         started = False
         finished = False
-        last = time.time()
+        t0 = time.time()
+        last = t0
         try:
             while True:
                 chunk = r.read(65536)
                 if not chunk:
-                    break
+                    break  # clean EOF (empty stream closed by server)
                 s = chunk.decode("utf-8", "replace")
                 buf.append(s)
                 last = time.time()
@@ -322,9 +327,15 @@ class AcpClient:
                         or '"sessionUpdate":"session_end"' in s:
                     finished = True
                     break
+                if not started and time.time() - t0 > first_frame_timeout:
+                    self.log("  [no first frame in %.0fs — treating as dead stream]"
+                             % first_frame_timeout)
+                    break
                 if time.time() - last > idle_timeout:
                     break
         except Exception as e:
+            # WinError 10054 (connection reset) on a recycled worker lands
+            # here with buf possibly holding only the ":ok" keepalive.
             self.log("  [stream read ended: %s]" % e)
         return st, "".join(buf), finished or started
 
@@ -381,13 +392,21 @@ def send_message(session_id, message, cwd=None, ensure=False, wait_idle=0,
             st, text, ok = client.prompt(sid, message, confirm_start=True)
             if st == 200 and ok:
                 return 0, "SENT|session=%s|port=%s|attempt=%d" % (sid, port, attempt)
-            # worker freshly recycled and lost the session? one load + retry
-            if st == 200 and "not found" in text.lower():
-                log("worker lost session; one session/load then retry...")
-                client.load_session(sid, cwd or "")
-                st, text, ok = client.prompt(sid, message, confirm_start=True)
-                if st == 200 and ok:
-                    return 0, "SENT|session=%s|port=%s|after-reload" % (sid, port)
+            # Worker freshly recycled and lost the session? Observed failure
+            # shapes (2026-09-18 field report): JSON-RPC error mentioning
+            # "not found", OR HTTP 200 with an EMPTY stream that dies with
+            # WinError 10054 (connection reset) — no error text at all.
+            # Retry once with an explicit session/load in BOTH cases.
+            if st == 200 and (not ok or "not found" in text.lower()):
+                log("turn not confirmed (ok=%s); one session/load then retry..." % ok)
+                try:
+                    client.load_session(sid, cwd or "")
+                    st, text, ok = client.prompt(sid, message, confirm_start=True)
+                except Exception as e:
+                    last_err = "reload-retry failed: %s: %s" % (type(e).__name__, e)
+                else:
+                    if st == 200 and ok:
+                        return 0, "SENT|session=%s|port=%s|after-reload" % (sid, port)
             last_err = "prompt HTTP %s ok=%s tail=%s" % (st, ok, text[-120:])
         except Exception as e:
             last_err = "%s: %s" % (type(e).__name__, e)
