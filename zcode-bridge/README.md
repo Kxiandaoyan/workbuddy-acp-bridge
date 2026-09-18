@@ -24,11 +24,26 @@
 node zcode_aps.mjs <工作区目录> <sessionId> "消息"
 # 例：
 node zcode_aps.mjs D:\hermes\code sess_35fd7fb5-6a61-4a72-8479-e104be06227c "继续刚才的分析"
+# 忙闲检验（与 WorkBuddy/Hermes/旧版 ZCode 桥同一约定，秒回、不发送）：
+node zcode_aps.mjs <目录> <sessionId> x --check            # IDLE|... 退出 0 / BUSY|... 退出 4
+# 发送默认带忙闸：目标会话正在跑轮次时拒发（BUSY 退出 4），不会打断也不会排队；
+node zcode_aps.mjs <目录> <sessionId> "..." --wait-idle 60  # 忙时最多等 60 秒直到空闲
+node zcode_aps.mjs <目录> <sessionId> "..." --queue-busy    # 忙时也发：进入会话队列，
+                                                            # 当前轮结束后被下一轮消化
 # 可选环境变量：
 #   HERMES_APS_MODEL=GLM-5.3-Flash   换模型（默认 GLM-5.3）
 #   HERMES_APS_LEVEL=high            思考档位（默认 max）
 #   HERMES_APS_WAIT=90000            等回复时长 ms（默认 60000）
 ```
+
+**忙闲信号**（与 `zcode_send.py` 同源）：共享库 `message` 表尾部——assistant 消息的
+`time` 缺 `completed` = 轮次进行中；尾部是未应答的 user 消息 = 有排队。忙闲输出
+约定与三桥一致：
+
+| 退出码 | 输出 | 含义 |
+|---|---|---|
+| 0 | `IDLE\|会话空闲，可以发送。\|session=...` | 空闲，可发 |
+| 4 | `BUSY\|现在会话正忙，请稍后再发。\|session=...` | 正忙，被拒发 |
 
 回复打印到 stdout，进度日志走 stderr（开头会打印 `[paths]` 三行，核对自动发现的路径）。
 sessionId 查法：`~/.zcode/cli/db/db.sqlite` 的 `session` 表按 `directory` 过滤，或旧版工具
@@ -60,10 +75,18 @@ builtin revision（从 CLI 日志提取）。**唯一前提：ZCode 桌面版在
 ### 原理（复刻桌面版驱动 CLI 的官方姿势）
 
 spawn `zcode.cjs app-server --stdio`（带桌面同款的两份 provider 配置文件
-环境变量）→ 等注册表就绪（~35 秒）→ `provider/updateAccountConfig` 推送账号
-权益状态（桌面每次拉起子进程后都做这一步）→ `session/resume` 激活会话 →
-等会话物化（~25 秒）→ `session/send` 逐次携带模型选择 → 通过反向调用
-`interaction/requestProviderRuntimeHeaders` 为每轮 API 请求提供鉴权。
+环境变量）→ **盯子进程日志等 `provider_registry.ready` 真信号**（不是固定秒数——
+这是曾导致"消息 accepted 但不处理"的竞态根源）→ `provider/updateAccountConfig`
+推送账号权益状态（桌面每次拉起子进程后都做这一步）→ `session/resume` 激活会话
+（此时物化用到的已是修正过的注册表）→ 等会话物化（~15 秒）→ `session/send`
+逐次携带模型选择 → 通过反向调用 `interaction/requestProviderRuntimeHeaders`
+为每轮 API 请求提供鉴权。
+
+轮次状态从 `turn-started / turn-completed / turn-failed` 事件跟踪（stderr 打印
+`[turn] ...`）；**失败自愈**：轮次失败时自动重推权益 + 重新物化会话 + 发一条
+出队触发（失败轮次的输入仍留在共享队列里，会被下一轮成功一起消化）。助手回复
+从共享库读取 text 片段（用户输入的片段 `time.start == time.end`，助手的有时长，
+以此区分——修掉了早期"打印出自己发的消息"的提取错误）。
 
 协议要点（ZCode Protocol，与 MCP/JSON-RPC 不同）：
 
@@ -72,8 +95,8 @@ spawn `zcode.cjs app-server --stdio`（带桌面同款的两份 provider 配置�
 - `basedOnZCodeBuiltinRevision` 必须是完整格式 `zcode-builtin:<rev>:<hash>`
   （工具自动从 `~/.zcode/cli/log/*.jsonl` 最新一条 `provider_registry.ready`
   提取；格式错会 fail-closed 清空账号 provider）；
-- 时序坑：注册表就绪前推送会被默认快照覆盖；`session/resume` 后立刻发送会
-  `model.available:[]`，必须等会话物化；
+- 时序坑：注册表就绪前推送会被默认快照覆盖，且 resume 时会话用坏注册表物化
+  之后就修不好——所以必须"就绪 → 推送 → resume"这个顺序；
 - 反向调用必须应答：`interaction/requestProviderRuntimeHeaders` →
   `{headersApplied:true, requestAuth:{apiKey}}`（bigmodel key 自动取自
   `~/.zcode/v2/config.json`）；`session/requestRuntimePreferences` → 最小偏好。

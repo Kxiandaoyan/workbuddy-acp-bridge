@@ -14,7 +14,7 @@
 //   HERMES_APS_MODEL / HERMES_APS_LEVEL / HERMES_APS_PROVIDER  模型/档位/provider
 //   HERMES_APS_WAIT / HERMES_APS_BOOT_WAIT  等回复/等启动毫秒数
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -135,9 +135,23 @@ function findBuiltinRevision() {
 const BUILTIN_REVISION = findBuiltinRevision();
 
 // ---------- 参数 ----------
-const [dir, sessionId, message] = process.argv.slice(2);
-if (!dir || !sessionId || !message) {
-  console.error('用法: node zcode_aps.mjs <工作区目录> <sessionId> <消息>');
+// ---------- 参数 ----------
+const argv = process.argv.slice(2);
+const flags = { check: false, waitIdle: 0, queueBusy: false };
+const positional = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === '--check') flags.check = true;
+  else if (a === '--wait-idle') flags.waitIdle = Number(argv[++i]) || 0;
+  else if (a === '--queue-busy' || a === '--force-busy') flags.queueBusy = true;
+  else positional.push(a);
+}
+const [dir, sessionId, message] = positional;
+if (!dir || !sessionId || (!message && !flags.check)) {
+  console.error('用法: node zcode_aps.mjs <工作区目录> <sessionId> <消息> [--check] [--wait-idle 秒] [--queue-busy]');
+  console.error('  --check        只查忙闲（IDLE|... / BUSY|...，退出码 0/4），不发送');
+  console.error('  --wait-idle N  忙时最多等 N 秒直到空闲再发');
+  console.error('  --queue-busy   忙时也发（进入会话队列，当前轮结束后被消化）');
   process.exit(2);
 }
 const MODEL = process.env.HERMES_APS_MODEL || 'GLM-5.3';
@@ -146,6 +160,52 @@ const PROVIDER = process.env.HERMES_APS_PROVIDER || 'account:bigmodel-individual
 const WAIT_MS = Number(process.env.HERMES_APS_WAIT || 60000);
 const extraModels = (process.env.HERMES_APS_MODELS || 'GLM-5.3-Flash').split(',').map(x => x.trim()).filter(Boolean);
 const MODEL_IDS = [MODEL, ...extraModels].filter((v, i, a) => a.indexOf(v) === i);
+
+// ---------- 忙闲检验（纯共享库查询，秒回，与 zcode_send.py 同一信号） ----------
+// 尾部 assistant 消息的 time 缺 completed = 轮次进行中；尾部是未应答的 user 消息 = 排队中。
+const wait2 = ms => new Promise(r => setTimeout(r, ms));
+async function sessionBusy(sid) {
+  try {
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(join(ZCODE_HOME, 'cli/db/db.sqlite'), { readOnly: true });
+    const rows = db.prepare(
+      'select CAST(data as TEXT) as d from message where session_id=? order by sequence desc limit 3'
+    ).all(sid);
+    db.close();
+    for (const r of rows) {
+      let d; try { d = JSON.parse(r.d); } catch { continue; }
+      const t = d.time ?? {};
+      if (d.role === 'assistant') return !('completed' in t);
+      if (d.role === 'user') return true; // 已排队未应答
+    }
+    return false;
+  } catch (e) {
+    console.error('[busy] 查询失败，按空闲处理:', e.message);
+    return false;
+  }
+}
+
+if (flags.check) {
+  const busy = await sessionBusy(sessionId);
+  if (busy) { console.log(`BUSY|现在会话正忙，请稍后再发。|session=${sessionId}`); process.exit(4); }
+  console.log(`IDLE|会话空闲，可以发送。|session=${sessionId}`);
+  process.exit(0);
+}
+
+if (!flags.queueBusy) {
+  let busy = await sessionBusy(sessionId);
+  const deadline = Date.now() + flags.waitIdle * 1000;
+  while (busy && Date.now() < deadline) {
+    console.error('waiting: session busy...');
+    await wait2(2000);
+    busy = await sessionBusy(sessionId);
+  }
+  if (busy) {
+    console.log(`BUSY|现在会话正忙，请稍后再发。|session=${sessionId}`);
+    process.exit(4);
+  }
+}
+
 
 // ---------- app-server 子进程 ----------
 const proc = spawn(process.execPath, [CLI, 'app-server', '--stdio', '--cwd', resolve(dir)], {
@@ -164,6 +224,7 @@ let buf = '';
 const pending = new Map();
 let nextId = 1;
 const texts = [];
+let turnState = 'idle'; // idle | running | done | failed
 const RE_TEXT = /"text":"((?:[^"\\]|\\.)*)"/g;
 
 proc.stdout.on('data', d => {
@@ -188,7 +249,14 @@ proc.stdout.on('data', d => {
       continue;
     }
     if (m.id !== undefined && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); continue; }
-    // 通知：收集助手文本
+    // 通知：跟踪轮次事件 + 收集助手文本
+    if (m.method === 'computer-use/operation-event') {
+      const kind = m.params?.kind;
+      if (kind === 'turn-started') { turnState = 'running'; console.error('[turn] started'); }
+      if (kind === 'turn-completed') { turnState = 'done'; console.error('[turn] completed'); }
+      if (kind === 'turn-failed') { turnState = 'failed'; console.error('[turn] FAILED'); }
+    }
+    if (m.method === 'state.updated' && m.params?.reason === 'prompt_failed') { turnState = 'failed'; console.error('[turn] prompt_failed'); }
     const s = JSON.stringify(m.params ?? {});
     let mm; RE_TEXT.lastIndex = 0;
     while ((mm = RE_TEXT.exec(s))) texts.push(mm[1]);
@@ -215,18 +283,58 @@ const accountPush = () => call('provider/updateAccountConfig', {
   states: { [PROVIDER]: { availability: 'available', entitled: true, current: true } },
 });
 
-// 1) 等注册表启动完成（约 25-40 秒）再推权益，否则会被持久化的 entitled:false 快照覆盖
-await wait(Number(process.env.HERMES_APS_BOOT_WAIT || 35000));
+// 1) 等注册表真正就绪：盯子进程写入的共享日志，等 spawn 之后出现
+//    provider_registry.ready 事件（固定等待是竞态根源：早推会被默认快照覆盖，
+//    且 resume 时会话用坏注册表物化后就修不好了）
+async function waitRegistryReady(timeoutMs = 90000) {
+  const logDir = join(ZCODE_HOME, 'cli/log');
+  const t0 = Date.now();
+  try {
+    const files = readdirSync(logDir).filter(f => f.endsWith('.jsonl')).sort().reverse();
+    for (const f of files.slice(0, 2)) {
+      const p = join(logDir, f);
+      let offset = 0;
+      try { offset = Math.max(0, statSync(p).size - 200000); } catch {}
+      while (Date.now() - t0 < timeoutMs) {
+        let chunk = '';
+        try {
+          const fd = openSync(p, 'r');
+          const buf = Buffer.alloc(statSync(p).size - offset);
+          readSync(fd, buf, 0, buf.length, offset);
+          closeSync(fd);
+          chunk = buf.toString('utf8');
+          offset += buf.length;
+        } catch { /* 文件轮转等，忽略 */ }
+        for (const line of chunk.split('\n')) {
+          try {
+            const d = JSON.parse(line);
+            if (d.event === 'zcode_protocol.provider_registry.ready' &&
+                Date.parse(d.timestamp ?? '') > t0 - 5000) return true;
+          } catch {}
+        }
+        await wait(1000);
+      }
+    }
+  } catch {}
+  return false; // 超时：按旧时序继续（回退行为）
+}
+console.error('等待注册表就绪（盯日志 provider_registry.ready）…');
+const ready = await waitRegistryReady();
+console.error(ready ? '注册表已就绪' : '（超时，按固定等待回退）');
+if (!ready) await wait(Number(process.env.HERMES_APS_BOOT_WAIT || 35000));
+
 const push = await accountPush();
 console.error('builtinRevision:', BUILTIN_REVISION);
 console.error('accountConfig:', JSON.stringify(push.result ?? push.error));
 if (push.error) { proc.kill(); process.exit(1); }
+await wait(2000);
 
-// 2) 激活会话（resume 后给会话物化留足时间：MCP 启动 + 注册表应用，约 15-25 秒）
+// 2) 激活会话（就绪后推送 → 立刻 resume，会话物化用到的就是修正过的注册表；
+//    之后再给 MCP 启动留 ~15 秒）
 const resume = await call('session/resume', { sessionId });
 console.error('resume:', JSON.stringify(resume.result ? 'ok' : (resume.error?.message ?? 'ok')).slice(0, 150));
 if (resume.error && resume.error.code !== -32004) { /* 记录但继续 */ }
-await wait(25000);
+await wait(15000);
 
 // 2.5) 防御性重推（若启动就绪晚于首次推送会被默认快照覆盖）
 const push2 = await accountPush();
@@ -244,28 +352,47 @@ if (send.error) {
 }
 console.error('send 已受理:', JSON.stringify(send.result ?? {}).slice(0, 200));
 
-// 4) 等回复流结束（等固定时长或文本停止增长）
-let lastLen = -1, stable = 0;
+// 4) 等轮次结束（看事件，不看文本增长）；失败自愈：重推 + 重新物化 + 触发出队
+const sendTime = Date.now();
 const t0 = Date.now();
-while (Date.now() - t0 < WAIT_MS) {
+while (Date.now() - t0 < WAIT_MS && (turnState === 'idle' || turnState === 'running')) {
   await wait(2000);
-  if (texts.join('').length === lastLen) { stable += 2; if (stable >= 8) break; } else stable = 0;
-  lastLen = texts.join('').length;
+  if (turnState === 'failed') {
+    console.error('[recovery] 轮次失败，重推权益 + 重新物化会话后触发出队…');
+    await accountPush();
+    await call('session/resume', { sessionId });
+    await wait(12000);
+    const retry = await call('session/send', {
+      sessionId,
+      content: '（继续：请处理上一条消息）',
+      modelSelection: { providerId: PROVIDER, modelId: MODEL, options: { reasoningLevel: LEVEL } },
+    });
+    console.error('[recovery] 触发出队:', JSON.stringify(retry.result ?? retry.error).slice(0, 150));
+    turnState = 'idle';
+  }
 }
-const all = texts.join('');
-if (all) {
-  console.log(all.slice(-2000));
+
+// 5) 取助手回复：优先共享库（用户输入的 text 片段 time.start==end，助手的有时长，以此区分）
+let reply = null;
+try {
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(join(ZCODE_HOME, 'cli/db/db.sqlite'), { readOnly: true });
+  const rows = db.prepare(
+    "select CAST(data as TEXT) as d, time_created from part where session_id=? and data like '%\"type\":\"text\"%' and time_created > ? order by time_created asc"
+  ).all(sessionId, sendTime - 15000);
+  db.close();
+  for (const r of rows) {
+    try {
+      const j = JSON.parse(r.d);
+      if (j.type === 'text' && j.time && j.time.start !== j.time.end && j.text) reply = j.text;
+    } catch {}
+  }
+} catch {}
+if (reply) {
+  console.log(reply.slice(-2000));
 } else {
-  // 通知流未订阅时从共享库读最新文本（可靠兜底）
-  try {
-    const { DatabaseSync } = await import('node:sqlite');
-    const db = new DatabaseSync(join(ZCODE_HOME, 'cli/db/db.sqlite'), { readOnly: true });
-    const row = db.prepare(
-      "select CAST(data as TEXT) as d from part where session_id=? and data like '%\"type\":\"text\"%' order by time_created desc limit 1"
-    ).get(sessionId);
-    db.close();
-    console.log(row ? (JSON.parse(row.d).text ?? JSON.stringify(JSON.parse(row.d)).slice(0, 500)) : '(未收到文本)');
-  } catch (e) { console.log('(未收到文本:', e.message, ')'); }
+  const all = texts.join('');
+  console.log(all ? all.slice(-2000) : '(未收到回复)');
 }
 proc.kill();
 process.exit(0);
