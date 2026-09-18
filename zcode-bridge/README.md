@@ -53,9 +53,16 @@ node zcode_aps.mjs <目录> <sessionId> "..." --queue-busy    # 忙时也发：�
 绝不制造新僵尸。默认等待窗口 `HERMES_APS_WAIT` 为 180 秒（原 60 秒对真实任务太短）。
 
 **PC 客户端可见性说明**：若轮次由本脚本自己的 app-server 实例执行，正在客户端
-打开的界面**不会实时刷新**这条外部轮次（客户端无文件监听）——内容确实在会话里，
+打开的界面**不会实时刷新**这条外部轮次（客户端无文件监听——代码级证据：桌面端
+app.asar 中 `db.sqlite` 出现 0 次，它只渲染自己子进程的内存态）——内容确实在会话里，
 切换会话再切回即可看到。若需要实时显示：目标会话在客户端开着时用 `--queue-busy`
 投递，由客户端自己的实例消化队列（"信道畅通"那次就是这个路径）。
+
+**定位提示**：hermes 的核心诉求是"发得进、处理掉、忙闲可查"——这三样本脚本已
+完备，**等轮次跑完再退出不是只为了取回复**：它保证会话回到干净的 completed 状态，
+下一条消息的忙闸才能正确判 IDLE。桌面上看不看得见属于可选加分项；若真需要
+"桌面端实时显示"，见 [`hijack/`](hijack/README.md) 子目录（本地假中继方案，
+协议已全部逆向、随取随用，需带环境变量重启一次桌面版），与本脚本互不依赖。
 
 回复打印到 stdout，进度日志走 stderr（开头会打印 `[paths]` 三行，核对自动发现的路径）。
 sessionId 查法：`~/.zcode/cli/db/db.sqlite` 的 `session` 表按 `directory` 过滤，或旧版工具
@@ -146,6 +153,9 @@ python ../zcode-bridge/zcode_send.py --cwd "..." --msg "..." --new              
 
 ## 附：本目录其他工具
 
+- `hijack/` —— **可选增强**：本地假中继劫持桌面版"手机远程控制"通道，让外部消息
+  由桌面自己的实例执行并**在客户端实时显示**（免云端/免手机）。完整原理、协议栈、
+  启用步骤见 [`hijack/README.md`](hijack/README.md)。日常只发消息不需要它。
 - `hermes_send.py` —— Hermes Desktop 桥接（WS JSON-RPC `prompt.submit`，消息实时
   显示在桌面端界面）。用法：`python hermes_send.py --list / --check / --msg`，
   详细文档见 git 历史（2026-09-16 版 README）。
