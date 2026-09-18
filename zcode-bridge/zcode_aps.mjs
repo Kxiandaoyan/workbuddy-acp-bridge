@@ -157,7 +157,7 @@ if (!dir || !sessionId || (!message && !flags.check)) {
 const MODEL = process.env.HERMES_APS_MODEL || 'GLM-5.3';
 const LEVEL = process.env.HERMES_APS_LEVEL || 'max';
 const PROVIDER = process.env.HERMES_APS_PROVIDER || 'account:bigmodel-individual-coding-plan';
-const WAIT_MS = Number(process.env.HERMES_APS_WAIT || 60000);
+const WAIT_MS = Number(process.env.HERMES_APS_WAIT || 180000);
 const extraModels = (process.env.HERMES_APS_MODELS || 'GLM-5.3-Flash').split(',').map(x => x.trim()).filter(Boolean);
 const MODEL_IDS = [MODEL, ...extraModels].filter((v, i, a) => a.indexOf(v) === i);
 
@@ -171,14 +171,30 @@ async function sessionBusy(sid) {
     const rows = db.prepare(
       'select CAST(data as TEXT) as d from message where session_id=? order by sequence desc limit 3'
     ).all(sid);
-    db.close();
+    let busy = false, lastMsgRaw = null;
     for (const r of rows) {
       let d; try { d = JSON.parse(r.d); } catch { continue; }
       const t = d.time ?? {};
-      if (d.role === 'assistant') return !('completed' in t);
-      if (d.role === 'user') return true; // 已排队未应答
+      if (d.role === 'assistant') { busy = !('completed' in t); lastMsgRaw = r.d; break; }
+      if (d.role === 'user') { busy = true; break; } // 已排队未应答
     }
-    return false;
+    if (!busy) { db.close(); return false; }
+    const lastPart = db.prepare('select max(time_created) as m from part where session_id=?').get(sid);
+    db.close();
+    // 自愈：尾部"进行中"但超过 3 分钟没有任何新 part = 所属进程已死（僵尸轮次，
+    // 常见于上一条发送的等待超时被杀）。补写 completed 解堵，视为空闲。
+    const ZOMBIE_MS = Number(process.env.HERMES_APS_ZOMBIE_MS || 180000);
+    if (lastMsgRaw !== null && (!lastPart?.m || Date.now() - lastPart.m > ZOMBIE_MS)) {
+      try {
+        const dbw = new DatabaseSync(join(ZCODE_HOME, 'cli/db/db.sqlite'));
+        const d = JSON.parse(lastMsgRaw); d.time = d.time ?? {}; d.time.completed = Date.now();
+        dbw.prepare('update message set data=? where session_id=? and data=?').run(JSON.stringify(d), sid, lastMsgRaw);
+        dbw.close();
+        console.error('[busy] 检测到僵尸轮次（超过 ' + Math.round(ZOMBIE_MS / 1000) + 's 无输出），已自动修复为空闲');
+        return false;
+      } catch (e) { console.error('[busy] 僵尸修复失败:', e.message); return true; }
+    }
+    return true;
   } catch (e) {
     console.error('[busy] 查询失败，按空闲处理:', e.message);
     return false;
@@ -394,5 +410,17 @@ if (reply) {
   const all = texts.join('');
   console.log(all ? all.slice(-2000) : '(未收到回复)');
 }
-proc.kill();
-process.exit(0);
+
+// 收尾：绝不在轮次进行中硬杀子进程（会留下僵尸轮次，把忙闸和客户端 UI 永久顶死）。
+// 仍在跑 → session/stop 干净停车（补写 completed），再退出。
+async function gracefulExit(code) {
+  if (turnState === 'running') {
+    console.error('[exit] 轮次仍在进行，先干净停车（session/stop）避免僵尸…');
+    try { await call('session/stop', { sessionId }); } catch {}
+    await wait(3000);
+  }
+  proc.kill();
+  process.exit(code);
+}
+process.on('SIGINT', () => { console.error('\n[interrupt]'); gracefulExit(130); });
+await gracefulExit(0);

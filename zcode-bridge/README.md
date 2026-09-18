@@ -45,6 +45,18 @@ node zcode_aps.mjs <目录> <sessionId> "..." --queue-busy    # 忙时也发：�
 | 0 | `IDLE\|会话空闲，可以发送。\|session=...` | 空闲，可发 |
 | 4 | `BUSY\|现在会话正忙，请稍后再发。\|session=...` | 正忙，被拒发 |
 
+**僵尸轮次自愈**：轮次进行中但所属进程已死（曾因发送方在等待超时后硬杀子进程，
+留下永远缺 `completed` 的尾部消息 → 会话被永久判定为忙）时，忙闲检验会发现
+"进行中但超过 3 分钟无任何新输出"并自动补写 `completed` 解堵（stderr 提示
+`[busy] 检测到僵尸轮次…`；阈值 `HERMES_APS_ZOMBIE_MS` 可调）。脚本自身也做了
+对应防护：等待超时或 Ctrl+C 时若轮次仍在跑，先 `session/stop` 干净停车再退出，
+绝不制造新僵尸。默认等待窗口 `HERMES_APS_WAIT` 为 180 秒（原 60 秒对真实任务太短）。
+
+**PC 客户端可见性说明**：若轮次由本脚本自己的 app-server 实例执行，正在客户端
+打开的界面**不会实时刷新**这条外部轮次（客户端无文件监听）——内容确实在会话里，
+切换会话再切回即可看到。若需要实时显示：目标会话在客户端开着时用 `--queue-busy`
+投递，由客户端自己的实例消化队列（"信道畅通"那次就是这个路径）。
+
 回复打印到 stdout，进度日志走 stderr（开头会打印 `[paths]` 三行，核对自动发现的路径）。
 sessionId 查法：`~/.zcode/cli/db/db.sqlite` 的 `session` 表按 `directory` 过滤，或旧版工具
 `python ../zcode-bridge/zcode_send.py --list`。
